@@ -11,24 +11,64 @@
         <header class="bg-blue-600 text-white p-4">
             <h1 class="text-xl font-bold text-center">⚽ Mijn Voetbal Team</h1>
         </header>
-        <main class="p-4">
-            <div id="status-card" class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded relative">
-                <p id="status-text">Server status laden...</p>
-            </div>
-        </main>
+<main class="p-4">
+    <h2 class="text-lg font-semibold mb-4">Team Spelers</h2>
+    
+    <!-- Lijst van spelers -->
+    <ul id="player-list" class="bg-white rounded-lg border mb-6">
+        <li class="p-3 border-b text-gray-500">Laden...</li>
+    </ul>
+
+    <!-- Formulier om speler toe te voegen -->
+    <div class="bg-gray-50 p-4 rounded-lg border">
+        <h3 class="text-sm font-bold mb-2 uppercase text-gray-600">Speler toevoegen</h3>
+        <div class="flex gap-2">
+            <input type="text" id="new-player-name" placeholder="Naam speler" class="flex-1 p-2 border rounded">
+            <button onclick="addPlayer()" class="bg-blue-600 text-white px-4 py-2 rounded font-bold">+</button>
+        </div>
+    </div>
+</main>
     </div>
 
-    <script>
-        // Check of de backend werkt
-        fetch('/api/status')
+<script>
+    // Functie om spelers op te halen
+    function loadPlayers() {
+        fetch('/api/players')
             .then(res => res.json())
-            .then(data => {
-                document.getElementById('status-text').innerText = data.message;
-            })
-            .catch(err => {
-                document.getElementById('status-text').innerText = "Fout bij verbinden met server.";
-                console.error(err);
+            .then(players => {
+                const list = document.getElementById('player-list');
+                list.innerHTML = '';
+                players.forEach(player => {
+                    const li = document.createElement('li');
+                    li.className = 'p-3 border-b flex justify-between items-center';
+                    li.innerHTML = `
+                        <span>${player.name}</span>
+                        <span class="text-xs bg-gray-200 px-2 py-1 rounded">${player.role}</span>
+                    `;
+                    list.appendChild(li);
+                });
             });
-    </script>
+    }
+
+    // Functie om speler toe te voegen
+    function addPlayer() {
+        const nameInput = document.getElementById('new-player-name');
+        const name = nameInput.value;
+        if (!name) return;
+
+        fetch('/api/players', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name })
+        })
+        .then(() => {
+            nameInput.value = '';
+            loadPlayers(); // Ververs de lijst
+        });
+    }
+
+    // Starten
+    loadPlayers();
+</script>
 </body>
 </html>
