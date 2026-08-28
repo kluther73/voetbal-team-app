@@ -83,6 +83,15 @@ app.post('/api/duties/generate', (req, res) => {
 app.get('/api/surveys', (req, res) => sendQuery('SELECT * FROM surveys ORDER BY deadline', [], res));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`Server is gestart op http://localhost:${PORT}`);
+});
+
+server.on('error', error => {
+    if (error.code === 'EADDRINUSE') {
+        console.error(`Poort ${PORT} is al in gebruik. Stop de bestaande server of start met PORT=3001 npm start.`);
+        process.exitCode = 1;
+        return;
+    }
+    throw error;
 });
