@@ -7,6 +7,8 @@ npm install
 npm start
 ```
 
+Demo-admin: `admin@team.nl` met wachtwoord `voetbal123`.
+
 ## voetbal.nl-integratie
 
 De team-manager beheert de koppeling via **Instellingen**. Vul daar de teamnaam, officiële team-id, endpoints en het access token in. Het token wordt versleuteld in de lokale database opgeslagen en komt niet terug naar de browser. Maak voor productie een `.env` met een stabiele `INTEGRATION_ENCRYPTION_KEY`; zie [.env.example](.env.example).

@@ -153,6 +153,7 @@ db.serialize(() => {
                 ['Sem Snel', 'player', 'sem@team.nl', passwordHash, 0, 0],
                 ['Anne Coach', 'team-manager', 'anne@team.nl', passwordHash, 0, 0],
                 ['Marco Trainer', 'trainer', 'marco@team.nl', passwordHash, 0, 0],
+                ['Beheerder RoodWit', 'admin', 'admin@team.nl', passwordHash, 0, 0],
                 ['Opa Jan', 'guardian', 'jan@team.nl', passwordHash, 0, 0],
                 ['Maaike Precies', 'guardian', 'maaike@team.nl', passwordHash, 0, 0],
                 ['Fatima Vaak', 'guardian', 'fatima@team.nl', passwordHash, 0, 0],

@@ -148,6 +148,113 @@ const allow = (...roles) => (req, res, next) => {
 
 app.use('/api', authenticate);
 
+app.get('/api/admin/teams', allow('admin'), (req, res) => {
+    sendQuery(`SELECT t.id, t.name, t.club, t.required_cars,
+        (SELECT manager.name FROM users manager JOIN team_members tm ON tm.user_id = manager.id
+            WHERE tm.team_id = t.id AND manager.role = 'team-manager' LIMIT 1) AS manager_name,
+        (SELECT manager.email FROM users manager JOIN team_members tm ON tm.user_id = manager.id
+            WHERE tm.team_id = t.id AND manager.role = 'team-manager' LIMIT 1) AS manager_email
+        FROM teams t ORDER BY t.club, t.name`, [], res);
+});
+
+app.post('/api/admin/teams', allow('admin'), async (req, res) => {
+    const { teamName, clubName, managerName, managerEmail, managerPassword } = req.body;
+    if (![teamName, clubName, managerName, managerEmail, managerPassword].every(value => String(value || '').trim())) {
+        return res.status(400).json({ error: 'Vul team, vereniging en gegevens van de team-manager in.' });
+    }
+    if (!/^\S+@\S+\.\S+$/.test(managerEmail)) return res.status(400).json({ error: 'Vul een geldig e-mailadres in.' });
+    if (String(managerPassword).length < 8) return res.status(400).json({ error: 'Het wachtwoord moet minimaal 8 tekens hebben.' });
+    try {
+        const duplicateTeam = await get('SELECT id FROM teams WHERE name = ? AND club = ?', [teamName.trim(), clubName.trim()]);
+        if (duplicateTeam) return res.status(400).json({ error: 'Dit team bestaat al binnen de vereniging.' });
+        let manager = await get('SELECT id, role FROM users WHERE email = ?', [managerEmail.trim().toLowerCase()]);
+        if (manager && manager.role !== 'team-manager') return res.status(400).json({ error: 'Dit e-mailadres hoort al bij een andere rol.' });
+        if (manager) {
+            const existingMembership = await get('SELECT team_id FROM team_members WHERE user_id = ?', [manager.id]);
+            if (existingMembership) return res.status(400).json({ error: 'Deze team-manager is al aan een team gekoppeld.' });
+            await run('UPDATE users SET name = ?, password_hash = ? WHERE id = ?', [managerName.trim(), bcrypt.hashSync(managerPassword, 10), manager.id]);
+        } else {
+            const created = await run('INSERT INTO users (name, role, email, password_hash) VALUES (?, ?, ?, ?)', [managerName.trim(), 'team-manager', managerEmail.trim().toLowerCase(), bcrypt.hashSync(managerPassword, 10)]);
+            manager = { id: created.lastID };
+        }
+        const team = await run('INSERT INTO teams (name, club) VALUES (?, ?)', [teamName.trim(), clubName.trim()]);
+        await run('INSERT INTO team_members (team_id, user_id) VALUES (?, ?)', [team.lastID, manager.id]);
+        res.status(201).json({ id: team.lastID, name: teamName.trim(), club: clubName.trim(), managerName: managerName.trim(), managerEmail: managerEmail.trim().toLowerCase() });
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'Team aanmaken mislukt.' });
+    }
+});
+
+app.get('/api/team-members', allow('team-manager'), (req, res) => {
+    sendQuery(`SELECT u.id, u.name, u.email, u.role, gp.player_id, player.name AS player_name
+        FROM users u
+        JOIN team_members tm ON tm.user_id = u.id
+        LEFT JOIN guardian_players gp ON gp.guardian_id = u.id
+        LEFT JOIN users player ON player.id = gp.player_id
+        WHERE tm.team_id = ? AND u.role IN ('player', 'guardian', 'trainer')
+        ORDER BY CASE u.role WHEN 'player' THEN 1 WHEN 'guardian' THEN 2 ELSE 3 END, u.name`, [req.user.teamId], res);
+});
+
+app.post('/api/team-members', allow('team-manager'), async (req, res) => {
+    const { name, email, role, password, playerId } = req.body;
+    if (!['player', 'guardian', 'trainer'].includes(role)) return res.status(400).json({ error: 'Kies een geldige rol.' });
+    if (![name, email, password].every(value => String(value || '').trim())) return res.status(400).json({ error: 'Vul naam, e-mailadres en tijdelijk wachtwoord in.' });
+    if (!/^\S+@\S+\.\S+$/.test(email) || String(password).length < 8) return res.status(400).json({ error: 'Vul een geldig e-mailadres en een wachtwoord van minimaal 8 tekens in.' });
+    try {
+        if (role === 'guardian') {
+            const player = await get(`SELECT u.id FROM users u JOIN team_members tm ON tm.user_id = u.id
+                WHERE u.id = ? AND tm.team_id = ? AND u.role = 'player'`, [playerId, req.user.teamId]);
+            if (!player) return res.status(400).json({ error: 'Kies een speler voor deze ouder/verzorger.' });
+        }
+        const existing = await get('SELECT id FROM users WHERE email = ?', [email.trim().toLowerCase()]);
+        if (existing) return res.status(400).json({ error: 'Dit e-mailadres is al in gebruik.' });
+        const member = await run('INSERT INTO users (name, role, email, password_hash) VALUES (?, ?, ?, ?)', [name.trim(), role, email.trim().toLowerCase(), bcrypt.hashSync(password, 10)]);
+        await run('INSERT INTO team_members (team_id, user_id) VALUES (?, ?)', [req.user.teamId, member.lastID]);
+        if (role === 'guardian') await run('INSERT INTO guardian_players (guardian_id, player_id) VALUES (?, ?)', [member.lastID, playerId]);
+        res.status(201).json({ id: member.lastID });
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'Teamlid toevoegen mislukt.' });
+    }
+});
+
+app.put('/api/team-members/:memberId', allow('team-manager'), async (req, res) => {
+    const memberId = Number(req.params.memberId);
+    const { name, email, playerId } = req.body;
+    try {
+        const member = await get(`SELECT u.id, u.role FROM users u JOIN team_members tm ON tm.user_id = u.id
+            WHERE u.id = ? AND tm.team_id = ? AND u.role IN ('player', 'guardian', 'trainer')`, [memberId, req.user.teamId]);
+        if (!member || !String(name || '').trim() || !/^\S+@\S+\.\S+$/.test(email || '')) return res.status(400).json({ error: 'Vul een geldige naam en e-mailadres in.' });
+        const duplicate = await get('SELECT id FROM users WHERE email = ? AND id != ?', [email.trim().toLowerCase(), memberId]);
+        if (duplicate) return res.status(400).json({ error: 'Dit e-mailadres is al in gebruik.' });
+        if (member.role === 'guardian') {
+            const player = await get(`SELECT u.id FROM users u JOIN team_members tm ON tm.user_id = u.id
+                WHERE u.id = ? AND tm.team_id = ? AND u.role = 'player'`, [playerId, req.user.teamId]);
+            if (!player) return res.status(400).json({ error: 'Kies een speler voor deze ouder/verzorger.' });
+            await run('DELETE FROM guardian_players WHERE guardian_id = ?', [memberId]);
+            await run('INSERT INTO guardian_players (guardian_id, player_id) VALUES (?, ?)', [memberId, playerId]);
+        }
+        await run('UPDATE users SET name = ?, email = ? WHERE id = ?', [name.trim(), email.trim().toLowerCase(), memberId]);
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'Teamlid wijzigen mislukt.' });
+    }
+});
+
+app.delete('/api/team-members/:memberId', allow('team-manager'), async (req, res) => {
+    const memberId = Number(req.params.memberId);
+    try {
+        const member = await get(`SELECT u.id FROM users u JOIN team_members tm ON tm.user_id = u.id
+            WHERE u.id = ? AND tm.team_id = ? AND u.role IN ('player', 'guardian', 'trainer')`, [memberId, req.user.teamId]);
+        if (!member) return res.status(404).json({ error: 'Teamlid niet gevonden.' });
+        await run('DELETE FROM guardian_players WHERE guardian_id = ? OR player_id = ?', [memberId, memberId]);
+        await run('DELETE FROM team_members WHERE team_id = ? AND user_id = ?', [req.user.teamId, memberId]);
+        await run('DELETE FROM users WHERE id = ?', [memberId]);
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'Teamlid verwijderen mislukt.' });
+    }
+});
+
 app.get('/api/integrations/voetbalnl', allow('team-manager'), (req, res) => {
     db.get(`SELECT t.name, t.club, integration.official_team_id, integration.matches_url, integration.trainings_url,
         integration.players_url, integration.other_fixtures_url, integration.access_token_encrypted
