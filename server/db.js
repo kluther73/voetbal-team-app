@@ -11,13 +11,15 @@ db.serialize(() => {
         name TEXT NOT NULL,
         role TEXT NOT NULL DEFAULT 'player',
         email TEXT,
+        source_external_id TEXT,
         exclude_driving INTEGER NOT NULL DEFAULT 0,
         exclude_flagging INTEGER NOT NULL DEFAULT 0
     )`);
     db.run(`CREATE TABLE IF NOT EXISTS teams (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
-        club TEXT NOT NULL
+        club TEXT NOT NULL,
+        required_cars INTEGER NOT NULL DEFAULT 5
     )`);
     db.run(`CREATE TABLE IF NOT EXISTS team_members (
         team_id INTEGER NOT NULL,
@@ -37,7 +39,9 @@ db.serialize(() => {
         time TEXT,
         location TEXT,
         opponent TEXT,
-        status TEXT DEFAULT 'upcoming'
+        status TEXT DEFAULT 'upcoming',
+        is_away INTEGER NOT NULL DEFAULT 0,
+        source_external_id TEXT
     )`);
     db.run(`CREATE TABLE IF NOT EXISTS attendance (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,10 +72,23 @@ db.serialize(() => {
         total INTEGER DEFAULT 0,
         status TEXT DEFAULT 'open'
     )`);
+    db.run(`CREATE TABLE IF NOT EXISTS external_fixtures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_id INTEGER NOT NULL,
+        source_external_id TEXT NOT NULL,
+        team_name TEXT NOT NULL,
+        opponent TEXT,
+        date TEXT NOT NULL,
+        time TEXT,
+        location TEXT,
+        is_away INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(team_id, source_external_id)
+    )`);
 
     // Bring the original starter database forward without losing its data.
     db.run('ALTER TABLE users ADD COLUMN email TEXT', () => {});
     db.run('ALTER TABLE users ADD COLUMN password_hash TEXT', () => {});
+    db.run('ALTER TABLE users ADD COLUMN source_external_id TEXT', () => {});
     db.run('ALTER TABLE users ADD COLUMN exclude_flagging INTEGER NOT NULL DEFAULT 0', () => {});
     db.run('ALTER TABLE events ADD COLUMN type TEXT DEFAULT \'match\'', () => {});
     db.run('ALTER TABLE events ADD COLUMN title TEXT', () => {});
@@ -79,11 +96,17 @@ db.serialize(() => {
     db.run('ALTER TABLE events ADD COLUMN location TEXT', () => {});
     db.run('ALTER TABLE events ADD COLUMN status TEXT DEFAULT \'upcoming\'', () => {});
     db.run('ALTER TABLE events ADD COLUMN team_id INTEGER', () => {});
+    db.run('ALTER TABLE events ADD COLUMN is_away INTEGER NOT NULL DEFAULT 0', () => {});
+    db.run('ALTER TABLE events ADD COLUMN source_external_id TEXT', () => {});
+    db.run('ALTER TABLE teams ADD COLUMN required_cars INTEGER NOT NULL DEFAULT 5', () => {});
+    db.run("UPDATE events SET is_away = 1 WHERE title LIKE 'Uitwedstrijd%'");
     db.run("UPDATE events SET title = COALESCE(title, 'Wedstrijd'), type = COALESCE(type, 'match') WHERE title IS NULL OR type IS NULL");
     db.run("UPDATE users SET email = CASE name WHEN 'Sjaak Afhaak' THEN 'sjaak@team.nl' WHEN 'Piet Precies' THEN 'piet@team.nl' WHEN 'Klaas Vaak' THEN 'klaas@team.nl' ELSE email END WHERE email IS NULL");
     db.run('UPDATE users SET password_hash = ? WHERE password_hash IS NULL', [bcrypt.hashSync('voetbal123', 10)]);
     
-    db.run("INSERT INTO teams (name, club) SELECT 'JO13-1', 'RoodWit' WHERE NOT EXISTS (SELECT 1 FROM teams)", () => {
+    db.get('SELECT COUNT(*) AS count FROM users', (existingErr, existingUsers) => {
+        if (existingErr || existingUsers.count > 0) return;
+        db.run("INSERT INTO teams (name, club) SELECT 'JO13-1', 'RoodWit' WHERE NOT EXISTS (SELECT 1 FROM teams)", () => {
         db.get('SELECT id FROM teams LIMIT 1', (teamErr, team) => {
             if (teamErr || !team) return;
             const passwordHash = bcrypt.hashSync('voetbal123', 10);
@@ -91,16 +114,20 @@ db.serialize(() => {
                 ['Sjaak Afhaak', 'player', 'sjaak@team.nl', passwordHash, 0, 0],
                 ['Piet Precies', 'player', 'piet@team.nl', passwordHash, 0, 0],
                 ['Klaas Vaak', 'player', 'klaas@team.nl', passwordHash, 1, 0],
+                ['Noor Nuchter', 'player', 'noor@team.nl', passwordHash, 0, 0],
+                ['Sem Snel', 'player', 'sem@team.nl', passwordHash, 0, 0],
                 ['Anne Coach', 'team-manager', 'anne@team.nl', passwordHash, 0, 0],
                 ['Marco Trainer', 'trainer', 'marco@team.nl', passwordHash, 0, 0],
                 ['Opa Jan', 'guardian', 'jan@team.nl', passwordHash, 0, 0],
                 ['Maaike Precies', 'guardian', 'maaike@team.nl', passwordHash, 0, 0],
-                ['Fatima Vaak', 'guardian', 'fatima@team.nl', passwordHash, 0, 0]
+                ['Fatima Vaak', 'guardian', 'fatima@team.nl', passwordHash, 0, 0],
+                ['Tessa Nuchter', 'guardian', 'tessa@team.nl', passwordHash, 0, 0],
+                ['Rob Snel', 'guardian', 'rob@team.nl', passwordHash, 0, 0]
             ];
             const events = [
-                ['match', 'Uitwedstrijd JO13-1', '2026-08-30', '10:00', 'Sportpark De Brug', 'SV Rivierwijk'],
-                ['training', 'Training', '2026-08-27', '18:30', 'Veld 2', null],
-                ['match', 'Thuiswedstrijd JO13-1', '2026-09-06', '09:30', 'Sportpark Zuid', 'FC Horizon']
+                ['match', 'Uitwedstrijd JO13-1', '2026-08-30', '10:00', 'Sportpark De Brug', 'SV Rivierwijk', 1],
+                ['training', 'Training', '2026-08-27', '18:30', 'Veld 2', null, 0],
+                ['match', 'Thuiswedstrijd JO13-1', '2026-09-06', '09:30', 'Sportpark Zuid', 'FC Horizon', 0]
             ];
 
             db.run('DELETE FROM attendance', () => db.run('DELETE FROM duties', () => db.run('DELETE FROM events', () =>
@@ -114,8 +141,10 @@ db.serialize(() => {
                                 FROM users guardian JOIN users player
                                 WHERE (guardian.email = 'jan@team.nl' AND player.email = 'sjaak@team.nl')
                                     OR (guardian.email = 'maaike@team.nl' AND player.email = 'piet@team.nl')
-                                    OR (guardian.email = 'fatima@team.nl' AND player.email = 'klaas@team.nl')`, () => {
-                                const eventsStatement = db.prepare('INSERT INTO events (type, title, date, time, location, opponent, team_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
+                                    OR (guardian.email = 'fatima@team.nl' AND player.email = 'klaas@team.nl')
+                                    OR (guardian.email = 'tessa@team.nl' AND player.email = 'noor@team.nl')
+                                    OR (guardian.email = 'rob@team.nl' AND player.email = 'sem@team.nl')`, () => {
+                                const eventsStatement = db.prepare('INSERT INTO events (type, title, date, time, location, opponent, is_away, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
                                 events.forEach(event => eventsStatement.run([...event, team.id]));
                                 eventsStatement.finalize(() => {
                                     db.run(`INSERT INTO attendance (event_id, user_id, status, responded_at)
@@ -133,6 +162,7 @@ db.serialize(() => {
                         });
                     });
                 }))))));
+        });
         });
     });
 });

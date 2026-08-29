@@ -1,5 +1,7 @@
+require('dotenv').config();
 const express = require('express');
 const db = require('./db');
+const voetbalNl = require('./voetbalnl');
 const path = require('path');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -14,6 +16,89 @@ const sendQuery = (sql, params, res) => db.all(sql, params, (err, rows) => {
     if (err) return res.status(400).json({ error: err.message });
     res.json(rows);
 });
+
+const run = (sql, params = []) => new Promise((resolve, reject) => db.run(sql, params, function(err) {
+    if (err) return reject(err);
+    resolve(this);
+}));
+const get = (sql, params = []) => new Promise((resolve, reject) => db.get(sql, params, (err, row) => err ? reject(err) : resolve(row)));
+const rows = (sql, params = []) => new Promise((resolve, reject) => db.all(sql, params, (err, result) => err ? reject(err) : resolve(result)));
+
+const field = (record, ...names) => names.map(name => record[name]).find(value => value !== undefined && value !== null && value !== '');
+const isTrue = value => value === true || ['1', 'true', 'ja', 'yes', 'uit'].includes(String(value).toLowerCase());
+
+const addAttendance = async (eventId, teamId) => {
+    await run(`INSERT OR IGNORE INTO attendance (event_id, user_id, status, responded_at)
+        SELECT ?, u.id, 'present', datetime('now')
+        FROM users u JOIN team_members tm ON tm.user_id = u.id
+        WHERE tm.team_id = ? AND u.role = 'player'`, [eventId, teamId]);
+};
+
+const importTeamData = async (teamId, payload) => {
+    const summary = { players: 0, events: 0, otherFixtures: 0 };
+    for (const sourcePlayer of payload.players || []) {
+        const externalId = String(field(sourcePlayer, 'id', 'externalId', 'external_id', 'playerId') || '');
+        const name = field(sourcePlayer, 'name', 'fullName', 'full_name');
+        if (!externalId || !name) continue;
+        const email = field(sourcePlayer, 'email', 'emailAddress', 'email_address') || null;
+        let player = await get('SELECT id FROM users WHERE source_external_id = ? OR (email IS NOT NULL AND email = ?) LIMIT 1', [externalId, email]);
+        if (player) {
+            await run('UPDATE users SET name = ?, email = COALESCE(?, email), source_external_id = ? WHERE id = ?', [name, email, externalId, player.id]);
+        } else {
+            player = await run('INSERT INTO users (name, role, email, source_external_id, password_hash) VALUES (?, ?, ?, ?, ?)', [name, 'player', email, externalId, bcrypt.hashSync('voetbal123', 10)]);
+        }
+        await run('INSERT OR IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)', [teamId, player.id || player.lastID]);
+        summary.players++;
+    }
+    for (const sourceEvent of payload.events || []) {
+        const externalId = String(field(sourceEvent, 'id', 'externalId', 'external_id', 'eventId') || '');
+        const type = field(sourceEvent, 'type', 'kind') === 'training' ? 'training' : 'match';
+        const title = field(sourceEvent, 'title', 'name') || (type === 'training' ? 'Training' : 'Wedstrijd');
+        const date = field(sourceEvent, 'date', 'startDate', 'start_date');
+        if (!externalId || !date) continue;
+        const values = [title, date, field(sourceEvent, 'time', 'startTime', 'start_time') || null, field(sourceEvent, 'location', 'venue') || null, field(sourceEvent, 'opponent', 'opponentName', 'opponent_name') || null, isTrue(field(sourceEvent, 'isAway', 'is_away', 'away')) ? 1 : 0, type, teamId, externalId];
+        const existing = await get('SELECT id FROM events WHERE team_id = ? AND source_external_id = ?', [teamId, externalId]);
+        if (existing) {
+            await run('UPDATE events SET title = ?, date = ?, time = ?, location = ?, opponent = ?, is_away = ?, type = ? WHERE id = ?', [...values.slice(0, 7), existing.id]);
+        } else {
+            const created = await run('INSERT INTO events (title, date, time, location, opponent, is_away, type, team_id, source_external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', values);
+            await addAttendance(created.lastID, teamId);
+        }
+        summary.events++;
+    }
+    for (const fixture of payload.otherFixtures || []) {
+        const externalId = String(field(fixture, 'id', 'externalId', 'external_id', 'eventId') || '');
+        const teamName = field(fixture, 'teamName', 'team_name', 'team') || 'Ander team';
+        const date = field(fixture, 'date', 'startDate', 'start_date');
+        if (!externalId || !date) continue;
+        await run(`INSERT INTO external_fixtures (team_id, source_external_id, team_name, opponent, date, time, location, is_away)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(team_id, source_external_id) DO UPDATE SET team_name = excluded.team_name, opponent = excluded.opponent,
+                date = excluded.date, time = excluded.time, location = excluded.location, is_away = excluded.is_away`,
+        [teamId, externalId, teamName, field(fixture, 'opponent', 'opponentName', 'opponent_name') || null, date, field(fixture, 'time', 'startTime', 'start_time') || null, field(fixture, 'location', 'venue') || null, isTrue(field(fixture, 'isAway', 'is_away', 'away')) ? 1 : 0]);
+        summary.otherFixtures++;
+    }
+    return summary;
+};
+
+const parseCsv = csv => {
+    const lines = csv.trim().split(/\r?\n/).filter(Boolean);
+    if (lines.length < 2) throw new Error('Het CSV-bestand bevat geen gegevens.');
+    const parseLine = line => {
+        const values = [];
+        let value = '';
+        let quoted = false;
+        for (let index = 0; index < line.length; index++) {
+            if (line[index] === '"') {
+                if (quoted && line[index + 1] === '"') { value += '"'; index++; } else quoted = !quoted;
+            } else if (line[index] === ',' && !quoted) { values.push(value.trim()); value = ''; } else value += line[index];
+        }
+        values.push(value.trim());
+        return values;
+    };
+    const headers = parseLine(lines[0]).map(header => header.toLowerCase().replaceAll(' ', '_'));
+    return lines.slice(1).map(line => Object.fromEntries(parseLine(line).map((value, index) => [headers[index], value])));
+};
 
 // Serveer de frontend bestanden uit de 'public' map
 app.use(express.static(path.join(__dirname, '../public')));
@@ -57,6 +142,46 @@ const allow = (...roles) => (req, res, next) => {
 
 app.use('/api', authenticate);
 
+app.get('/api/integrations/voetbalnl', allow('team-manager'), (req, res) => {
+    res.json({ configured: voetbalNl.configured(), teamId: process.env.VOETBAL_NL_TEAM_ID || null });
+});
+
+app.post('/api/integrations/voetbalnl/sync', allow('team-manager'), async (req, res) => {
+    try {
+        const data = await voetbalNl.fetchTeamData();
+        const summary = await importTeamData(req.user.teamId, {
+            players: data.players,
+            events: [...data.matches.map(match => ({ ...match, type: 'match' })), ...data.trainings.map(training => ({ ...training, type: 'training' }))],
+            otherFixtures: data.otherFixtures
+        });
+        res.json(summary);
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'Synchronisatie met voetbal.nl mislukt.' });
+    }
+});
+
+app.post('/api/integrations/voetbalnl/csv', allow('team-manager'), async (req, res) => {
+    try {
+        const records = parseCsv(req.body.csv || '');
+        const data = { players: [], events: [], otherFixtures: [] };
+        records.forEach(record => {
+            const type = String(field(record, 'record_type', 'type', 'kind') || '').toLowerCase();
+            if (type === 'player' || type === 'speler') data.players.push(record);
+            else if (type === 'training') data.events.push({ ...record, type: 'training' });
+            else if (type === 'match' || type === 'wedstrijd') data.events.push({ ...record, type: 'match' });
+            else if (type === 'other-match' || type === 'andere-wedstrijd') data.otherFixtures.push(record);
+        });
+        const summary = await importTeamData(req.user.teamId, data);
+        res.json(summary);
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'CSV-import mislukt.' });
+    }
+});
+
+app.get('/api/external-fixtures', (req, res) => {
+    sendQuery('SELECT * FROM external_fixtures WHERE team_id = ? ORDER BY date, time', [req.user.teamId], res);
+});
+
 // Haal alle spelers op
 app.get('/api/players', (req, res) => {
     sendQuery(`SELECT u.id, u.name, u.role, u.email, u.exclude_driving, u.exclude_flagging
@@ -91,10 +216,10 @@ app.get('/api/events', (req, res) => {
 });
 
 app.post('/api/events', allow('admin', 'team-manager'), (req, res) => {
-    const { type, title, date, time, location, opponent } = req.body;
+    const { type, title, date, time, location, opponent, isAway } = req.body;
     if (!['training', 'match'].includes(type)) return res.status(400).json({ error: 'Ongeldig event type.' });
-    db.run('INSERT INTO events (type, title, date, time, location, opponent, team_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [type, title, date, time || null, location || null, opponent || null, req.user.teamId], function(err) {
+    db.run('INSERT INTO events (type, title, date, time, location, opponent, is_away, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [type, title, date, time || null, location || null, opponent || null, isAway ? 1 : 0, req.user.teamId], function(err) {
             if (err) return res.status(400).json({ error: err.message });
             const eventId = this.lastID;
             db.all('SELECT id FROM users WHERE role = ? AND id IN (SELECT user_id FROM team_members WHERE team_id = ?)',
@@ -158,29 +283,81 @@ app.get('/api/duty-options', allow('team-manager'), (req, res) => {
         ORDER BY player.name, guardian.name`, [req.user.teamId], res);
 });
 
+app.get('/api/team-settings', (req, res) => {
+    db.get(`SELECT t.required_cars,
+        (SELECT manager.name FROM users manager JOIN team_members tm ON tm.user_id = manager.id
+            WHERE tm.team_id = t.id AND manager.role = 'team-manager' LIMIT 1) AS manager_name
+        FROM teams t WHERE t.id = ?`, [req.user.teamId], (err, team) => {
+        if (err || !team) return res.status(404).json({ error: 'Team niet gevonden.' });
+        res.json(team);
+    });
+});
+
+app.post('/api/team-settings', allow('team-manager'), (req, res) => {
+    const requiredCars = Number(req.body.requiredCars);
+    if (!Number.isInteger(requiredCars) || requiredCars < 2 || requiredCars > 12) {
+        return res.status(400).json({ error: 'Kies tussen 2 en 12 auto’s.' });
+    }
+    db.run('UPDATE teams SET required_cars = ? WHERE id = ?', [requiredCars, req.user.teamId], err => {
+        if (err) return res.status(400).json({ error: err.message });
+        res.json({ requiredCars });
+    });
+});
+
 app.post('/api/duties/generate', allow('team-manager'), (req, res) => {
     const { type, eventId } = req.body;
     if (!['driver', 'flagger'].includes(type)) return res.status(400).json({ error: 'Ongeldig taaktype.' });
-    const excluded = type === 'driver' ? 'exclude_driving' : 'exclude_flagging';
-    db.get('SELECT id FROM events WHERE id = ? AND team_id = ?', [eventId, req.user.teamId], (eventErr, event) => {
+    db.get('SELECT id, is_away FROM events WHERE id = ? AND team_id = ?', [eventId, req.user.teamId], (eventErr, event) => {
         if (eventErr || !event) return res.status(404).json({ error: 'Activiteit niet gevonden.' });
-        db.get(`SELECT player.id AS player_id, guardian.id AS guardian_id
+        if (type === 'driver' && !event.is_away) return res.status(400).json({ error: 'Een rijschema is alleen nodig voor uitwedstrijden.' });
+        const selectAssignment = (excluded, excludedPlayerId, callback) => db.all(`SELECT player.id AS player_id, guardian.id AS guardian_id
             FROM users player
             JOIN team_members tm ON tm.user_id = player.id
             JOIN guardian_players gp ON gp.player_id = player.id
             JOIN users guardian ON guardian.id = gp.guardian_id
-            WHERE tm.team_id = ? AND player.role = 'player' AND player.${excluded} = 0
+            WHERE tm.team_id = ? AND player.role = 'player' AND player.${excluded} = 0 ${excludedPlayerId ? 'AND player.id != ?' : ''}
             ORDER BY (SELECT COUNT(*) FROM duties previous JOIN events previous_event ON previous_event.id = previous.event_id
                 WHERE previous.user_id = player.id AND previous.type = ? AND previous_event.team_id = ?), player.name, guardian.name
-            LIMIT 1`, [req.user.teamId, type, req.user.teamId], (err, assignment) => {
-            if (err || !assignment) return res.status(400).json({ error: 'Geen beschikbare speler met ouder/verzorger.' });
+            LIMIT ?`, excludedPlayerId ? [req.user.teamId, excludedPlayerId, type, req.user.teamId, 12] : [req.user.teamId, type, req.user.teamId, 12], callback);
+        const sendDuties = () => sendQuery(dutyQuery, [req.user.teamId], res);
+        const saveFlagger = callback => {
+            db.get('SELECT user_id AS player_id, guardian_id FROM duties WHERE event_id = ? AND type = ?', [eventId, 'flagger'], (flagErr, flagger) => {
+                if (flagErr) return res.status(400).json({ error: flagErr.message });
+                if (flagger) return callback(flagger);
+                selectAssignment('exclude_flagging', null, (selectionErr, selections) => {
+                    if (selectionErr || !selections.length) return res.status(400).json({ error: 'Geen beschikbare vlagger met ouder/verzorger.' });
+                    const selected = selections[0];
+                    db.run('INSERT INTO duties (event_id, user_id, guardian_id, type, note) VALUES (?, ?, ?, ?, ?)',
+                        [eventId, selected.player_id, selected.guardian_id, 'flagger', 'Automatisch verdeeld'], insertErr => {
+                            if (insertErr) return res.status(400).json({ error: insertErr.message });
+                            callback(selected);
+                        });
+                });
+            });
+        };
+        if (type === 'flagger') {
             db.run('DELETE FROM duties WHERE event_id = ? AND type = ?', [eventId, type], deleteErr => {
                 if (deleteErr) return res.status(400).json({ error: deleteErr.message });
-                db.run('INSERT INTO duties (event_id, user_id, guardian_id, type, note) VALUES (?, ?, ?, ?, ?)',
-                    [eventId, assignment.player_id, assignment.guardian_id, type, 'Automatisch verdeeld'], insertErr => {
-                        if (insertErr) return res.status(400).json({ error: insertErr.message });
-                        sendQuery(dutyQuery, [req.user.teamId], res);
+                saveFlagger(sendDuties);
+            });
+            return;
+        }
+        db.get('SELECT required_cars FROM teams WHERE id = ?', [req.user.teamId], (teamErr, team) => {
+            if (teamErr || !team) return res.status(404).json({ error: 'Team niet gevonden.' });
+            saveFlagger(flagger => {
+                const additionalDrivers = Math.max(team.required_cars - 2, 0);
+                selectAssignment('exclude_driving', flagger.player_id, (selectionErr, selections) => {
+                    if (selectionErr) return res.status(400).json({ error: selectionErr.message });
+                    db.run('DELETE FROM duties WHERE event_id = ? AND type = ?', [eventId, 'driver'], deleteErr => {
+                        if (deleteErr) return res.status(400).json({ error: deleteErr.message });
+                        const statement = db.prepare('INSERT INTO duties (event_id, user_id, guardian_id, type, note) VALUES (?, ?, ?, ?, ?)');
+                        selections.slice(0, additionalDrivers).forEach(driver => statement.run([eventId, driver.player_id, driver.guardian_id, 'driver', 'Automatisch verdeeld']));
+                        statement.finalize(finalizeErr => {
+                            if (finalizeErr) return res.status(400).json({ error: finalizeErr.message });
+                            sendDuties();
+                        });
                     });
+                });
             });
         });
     });
@@ -189,6 +366,7 @@ app.post('/api/duties/generate', allow('team-manager'), (req, res) => {
 app.post('/api/duties', allow('team-manager'), (req, res) => {
     const { eventId, type, playerId, guardianId } = req.body;
     if (!['driver', 'flagger'].includes(type)) return res.status(400).json({ error: 'Ongeldig taaktype.' });
+    if (type === 'driver') return res.status(400).json({ error: 'Gebruik automatisch verdelen voor het rijschema.' });
     const excluded = type === 'driver' ? 'exclude_driving' : 'exclude_flagging';
     db.get(`SELECT event.id
         FROM events event
