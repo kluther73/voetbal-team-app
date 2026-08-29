@@ -70,7 +70,29 @@ db.serialize(() => {
         deadline TEXT NOT NULL,
         responses INTEGER DEFAULT 0,
         total INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'open'
+        status TEXT DEFAULT 'open',
+        team_id INTEGER,
+        target_audience TEXT NOT NULL DEFAULT 'both',
+        title TEXT
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS survey_questions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        survey_id INTEGER NOT NULL,
+        question TEXT NOT NULL,
+        selection_type TEXT NOT NULL DEFAULT 'single'
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS survey_options (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        question_id INTEGER NOT NULL,
+        label TEXT NOT NULL,
+        position INTEGER NOT NULL
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS survey_answers (
+        survey_id INTEGER NOT NULL,
+        question_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        option_id INTEGER NOT NULL,
+        PRIMARY KEY (question_id, user_id, option_id)
     )`);
     db.run(`CREATE TABLE IF NOT EXISTS external_fixtures (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,6 +131,9 @@ db.serialize(() => {
     db.run('ALTER TABLE events ADD COLUMN is_away INTEGER NOT NULL DEFAULT 0', () => {});
     db.run('ALTER TABLE events ADD COLUMN source_external_id TEXT', () => {});
     db.run('ALTER TABLE teams ADD COLUMN required_cars INTEGER NOT NULL DEFAULT 5', () => {});
+    db.run('ALTER TABLE surveys ADD COLUMN team_id INTEGER', () => {});
+    db.run("ALTER TABLE surveys ADD COLUMN target_audience TEXT NOT NULL DEFAULT 'both'", () => {});
+    db.run('ALTER TABLE surveys ADD COLUMN title TEXT', () => {});
     db.run("UPDATE events SET is_away = 1 WHERE title LIKE 'Uitwedstrijd%'");
     db.run("UPDATE events SET title = COALESCE(title, 'Wedstrijd'), type = COALESCE(type, 'match') WHERE title IS NULL OR type IS NULL");
     db.run("UPDATE users SET email = CASE name WHEN 'Sjaak Afhaak' THEN 'sjaak@team.nl' WHEN 'Piet Precies' THEN 'piet@team.nl' WHEN 'Klaas Vaak' THEN 'klaas@team.nl' ELSE email END WHERE email IS NULL");
@@ -163,9 +188,7 @@ db.serialize(() => {
                                         JOIN team_members tm ON tm.team_id = event.team_id
                                         JOIN users player ON player.id = tm.user_id AND player.role = 'player'
                                         WHERE event.team_id = ?`, [team.id], () => {
-                                        db.run('DELETE FROM surveys', () => {
-                                            db.run("INSERT INTO surveys (question, deadline, responses, total) VALUES ('Wie kan er mee naar het teamweekend?', '2026-09-02', 8, 12)");
-                                        });
+                                        db.run('DELETE FROM surveys');
                                     });
                                 });
                             });

@@ -434,7 +434,76 @@ app.post('/api/duties', allow('team-manager'), (req, res) => {
     });
 });
 
-app.get('/api/surveys', (req, res) => sendQuery('SELECT * FROM surveys ORDER BY deadline', [], res));
+const audienceRoles = audience => audience === 'players' ? ['player'] : audience === 'guardians' ? ['guardian'] : ['player', 'guardian'];
+
+app.get('/api/surveys', (req, res) => {
+    db.all(`SELECT s.*, COUNT(DISTINCT answer.user_id) AS responses,
+        (SELECT COUNT(*) FROM team_members tm JOIN users recipient ON recipient.id = tm.user_id
+            WHERE tm.team_id = s.team_id AND (
+                (s.target_audience = 'players' AND recipient.role = 'player') OR
+                (s.target_audience = 'guardians' AND recipient.role = 'guardian') OR
+                (s.target_audience = 'both' AND recipient.role IN ('player', 'guardian'))
+            )) AS total
+        FROM surveys s LEFT JOIN survey_answers answer ON answer.survey_id = s.id
+        WHERE s.team_id = ? AND s.status = 'open' GROUP BY s.id ORDER BY s.deadline`, [req.user.teamId], (err, surveys) => {
+        if (err) return res.status(400).json({ error: err.message });
+        const visible = req.user.role === 'team-manager' ? surveys : surveys.filter(survey => audienceRoles(survey.target_audience).includes(req.user.role));
+        Promise.all(visible.map(async survey => ({
+            ...survey,
+            questions: await rows(`SELECT q.*, (SELECT COUNT(*) FROM survey_answers a WHERE a.question_id = q.id AND a.user_id = ?) AS answered
+                FROM survey_questions q WHERE q.survey_id = ? ORDER BY q.id`, [req.user.id, survey.id])
+        }))).then(async result => {
+            for (const survey of result) {
+                for (const question of survey.questions) question.options = await rows('SELECT id, label, position FROM survey_options WHERE question_id = ? ORDER BY position', [question.id]);
+            }
+            res.json(result);
+        }).catch(error => res.status(400).json({ error: error.message }));
+    });
+});
+
+app.post('/api/surveys', allow('team-manager'), async (req, res) => {
+    const { title, deadline, targetAudience, selectionType, question, options } = req.body;
+    if (!['players', 'guardians', 'both'].includes(targetAudience)) return res.status(400).json({ error: 'Kies een doelgroep.' });
+    if (!['single', 'multiple'].includes(selectionType)) return res.status(400).json({ error: 'Kies een vraagtype.' });
+    if (!deadline || !question || !Array.isArray(options) || options.length < 2 || options.some(option => !String(option).trim())) {
+        return res.status(400).json({ error: 'Vul deadline, vraag en minstens twee antwoordopties in.' });
+    }
+    try {
+        const survey = await run(`INSERT INTO surveys (question, title, deadline, team_id, target_audience, status)
+            VALUES (?, ?, ?, ?, ?, 'open')`, [question.trim(), title?.trim() || question.trim(), deadline, req.user.teamId, targetAudience]);
+        const createdQuestion = await run('INSERT INTO survey_questions (survey_id, question, selection_type) VALUES (?, ?, ?)', [survey.lastID, question.trim(), selectionType]);
+        for (const [position, label] of options.map(option => option.trim()).entries()) {
+            await run('INSERT INTO survey_options (question_id, label, position) VALUES (?, ?, ?)', [createdQuestion.lastID, label, position]);
+        }
+        res.json({ id: survey.lastID });
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'Enquête aanmaken mislukt.' });
+    }
+});
+
+app.post('/api/surveys/:surveyId/answers', async (req, res) => {
+    const surveyId = Number(req.params.surveyId);
+    const answers = Array.isArray(req.body.answers) ? req.body.answers : [];
+    try {
+        const survey = await get('SELECT * FROM surveys WHERE id = ? AND team_id = ? AND status = ?', [surveyId, req.user.teamId, 'open']);
+        if (!survey || !audienceRoles(survey.target_audience).includes(req.user.role)) return res.status(403).json({ error: 'Deze enquête is niet voor jou beschikbaar.' });
+        const questions = await rows('SELECT * FROM survey_questions WHERE survey_id = ?', [surveyId]);
+        if (answers.length !== questions.length) return res.status(400).json({ error: 'Beantwoord iedere vraag.' });
+        for (const question of questions) {
+            const selection = answers.find(answer => Number(answer.questionId) === question.id)?.optionIds || [];
+            if (!Array.isArray(selection) || !selection.length || (question.selection_type === 'single' && selection.length !== 1)) {
+                return res.status(400).json({ error: 'Kies een geldig antwoord.' });
+            }
+            const validOptions = await rows(`SELECT id FROM survey_options WHERE question_id = ? AND id IN (${selection.map(() => '?').join(',')})`, [question.id, ...selection]);
+            if (validOptions.length !== selection.length) return res.status(400).json({ error: 'Ongeldige antwoordoptie.' });
+            await run('DELETE FROM survey_answers WHERE question_id = ? AND user_id = ?', [question.id, req.user.id]);
+            for (const option of selection) await run('INSERT INTO survey_answers (survey_id, question_id, user_id, option_id) VALUES (?, ?, ?, ?)', [surveyId, question.id, req.user.id, option]);
+        }
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'Antwoord opslaan mislukt.' });
+    }
+});
 
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
