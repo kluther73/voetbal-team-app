@@ -84,8 +84,32 @@ app.get('/api/events', (req, res) => {
     const isTrainer = req.user.role === 'trainer';
     const typeFilter = isTrainer ? "AND e.type = 'training'" : '';
     return sendQuery(`SELECT e.*, COALESCE(SUM(a.status = 'present'), 0) AS present,
+        COALESCE(SUM(a.status = 'absent'), 0) AS absent,
+        COALESCE(SUM(a.status = 'maybe'), 0) AS maybe,
         (SELECT COUNT(*) FROM team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id = ? AND u.role = 'player') AS total FROM events e
         LEFT JOIN attendance a ON a.event_id = e.id WHERE e.team_id = ? ${typeFilter} GROUP BY e.id ORDER BY e.date`, [req.user.teamId, req.user.teamId], res);
+});
+
+app.post('/api/events', allow('admin', 'team-manager'), (req, res) => {
+    const { type, title, date, time, location, opponent } = req.body;
+    if (!['training', 'match'].includes(type)) return res.status(400).json({ error: 'Ongeldig event type.' });
+    db.run('INSERT INTO events (type, title, date, time, location, opponent, team_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [type, title, date, time || null, location || null, opponent || null, req.user.teamId], function(err) {
+            if (err) return res.status(400).json({ error: err.message });
+            const eventId = this.lastID;
+            db.all('SELECT id FROM users WHERE role = ? AND id IN (SELECT user_id FROM team_members WHERE team_id = ?)',
+                ['player', req.user.teamId], (playersErr, players) => {
+                    if (playersErr) return res.status(400).json({ error: playersErr.message });
+                    if (players.length === 0) return res.json({ id: eventId, type, title, date, time, location, opponent, team_id: req.user.teamId, present: 0, total: 0 });
+                    const stmt = db.prepare('INSERT INTO attendance (event_id, user_id, status, responded_at) VALUES (?, ?, ?, datetime("now"))');
+                    players.forEach(player => stmt.run([eventId, player.id, 'present']));
+                    stmt.finalize(() => {
+                        res.json({ id: eventId, type, title, date, time, location, opponent, team_id: req.user.teamId, present: players.length, total: players.length });
+                    });
+                }
+            );
+        }
+    );
 });
 
 app.get('/api/attendance/:eventId', (req, res) => {
@@ -94,7 +118,7 @@ app.get('/api/attendance/:eventId', (req, res) => {
     if (!allowedRoles.includes(req.user.role)) {
         return sendQuery(`SELECT a.*, u.id AS user_id, u.name, u.role
             FROM attendance a JOIN users u ON u.id = a.user_id
-            WHERE a.event_id = ? AND u.id = ? AND u.role = 'player' ORDER BY u.name`, [eventId, req.user.id], res);
+            WHERE a.event_id = ? AND a.user_id = ? AND u.role = 'player' ORDER BY u.name`, [eventId, req.user.id], res);
     }
     return sendQuery(`SELECT a.*, u.id AS user_id, u.name, u.role
         FROM attendance a JOIN users u ON u.id = a.user_id
@@ -114,22 +138,73 @@ app.post('/api/attendance', (req, res) => {
     });
 });
 
-app.get('/api/duties', (req, res) => sendQuery(`SELECT d.*, u.name, u.exclude_driving, u.exclude_flagging, e.title, e.date
-    FROM duties d JOIN users u ON u.id = d.user_id JOIN events e ON e.id = d.event_id ORDER BY e.date`, [], res));
+const dutyQuery = `SELECT d.*, u.name AS player_name, g.name AS guardian_name, e.title, e.date
+    FROM duties d
+    JOIN users u ON u.id = d.user_id
+    JOIN users g ON g.id = d.guardian_id
+    JOIN events e ON e.id = d.event_id
+    WHERE e.team_id = ?
+    ORDER BY e.date, d.type`;
 
-app.post('/api/duties/generate', allow('admin', 'team-manager'), (req, res) => {
+app.get('/api/duties', (req, res) => sendQuery(dutyQuery, [req.user.teamId], res));
+
+app.get('/api/duty-options', allow('team-manager'), (req, res) => {
+    sendQuery(`SELECT player.id AS player_id, player.name AS player_name, guardian.id AS guardian_id, guardian.name AS guardian_name
+        FROM guardian_players gp
+        JOIN users player ON player.id = gp.player_id
+        JOIN users guardian ON guardian.id = gp.guardian_id
+        JOIN team_members tm ON tm.user_id = player.id
+        WHERE tm.team_id = ? AND player.role = 'player'
+        ORDER BY player.name, guardian.name`, [req.user.teamId], res);
+});
+
+app.post('/api/duties/generate', allow('team-manager'), (req, res) => {
     const { type, eventId } = req.body;
+    if (!['driver', 'flagger'].includes(type)) return res.status(400).json({ error: 'Ongeldig taaktype.' });
     const excluded = type === 'driver' ? 'exclude_driving' : 'exclude_flagging';
-    db.all(`SELECT id FROM users WHERE role = 'player' AND ${excluded} = 0 ORDER BY id`, [], (err, users) => {
-        if (err || users.length === 0) return res.status(400).json({ error: 'Geen beschikbare spelers.' });
-        db.get('SELECT COUNT(*) AS count FROM duties WHERE type = ?', [type], (countErr, row) => {
-            if (countErr) return res.status(400).json({ error: countErr.message });
-            const selected = users[row.count % users.length];
-            db.run('INSERT OR REPLACE INTO duties (event_id, user_id, type, note) VALUES (?, ?, ?, ?)', [eventId, selected.id, type, 'Automatisch verdeeld'], err2 => {
-                if (err2) return res.status(400).json({ error: err2.message });
-                sendQuery(`SELECT d.*, u.name, u.exclude_driving, u.exclude_flagging, e.title, e.date
-                    FROM duties d JOIN users u ON u.id = d.user_id JOIN events e ON e.id = d.event_id ORDER BY e.date`, [], res);
+    db.get('SELECT id FROM events WHERE id = ? AND team_id = ?', [eventId, req.user.teamId], (eventErr, event) => {
+        if (eventErr || !event) return res.status(404).json({ error: 'Activiteit niet gevonden.' });
+        db.get(`SELECT player.id AS player_id, guardian.id AS guardian_id
+            FROM users player
+            JOIN team_members tm ON tm.user_id = player.id
+            JOIN guardian_players gp ON gp.player_id = player.id
+            JOIN users guardian ON guardian.id = gp.guardian_id
+            WHERE tm.team_id = ? AND player.role = 'player' AND player.${excluded} = 0
+            ORDER BY (SELECT COUNT(*) FROM duties previous JOIN events previous_event ON previous_event.id = previous.event_id
+                WHERE previous.user_id = player.id AND previous.type = ? AND previous_event.team_id = ?), player.name, guardian.name
+            LIMIT 1`, [req.user.teamId, type, req.user.teamId], (err, assignment) => {
+            if (err || !assignment) return res.status(400).json({ error: 'Geen beschikbare speler met ouder/verzorger.' });
+            db.run('DELETE FROM duties WHERE event_id = ? AND type = ?', [eventId, type], deleteErr => {
+                if (deleteErr) return res.status(400).json({ error: deleteErr.message });
+                db.run('INSERT INTO duties (event_id, user_id, guardian_id, type, note) VALUES (?, ?, ?, ?, ?)',
+                    [eventId, assignment.player_id, assignment.guardian_id, type, 'Automatisch verdeeld'], insertErr => {
+                        if (insertErr) return res.status(400).json({ error: insertErr.message });
+                        sendQuery(dutyQuery, [req.user.teamId], res);
+                    });
             });
+        });
+    });
+});
+
+app.post('/api/duties', allow('team-manager'), (req, res) => {
+    const { eventId, type, playerId, guardianId } = req.body;
+    if (!['driver', 'flagger'].includes(type)) return res.status(400).json({ error: 'Ongeldig taaktype.' });
+    const excluded = type === 'driver' ? 'exclude_driving' : 'exclude_flagging';
+    db.get(`SELECT event.id
+        FROM events event
+        JOIN team_members tm ON tm.user_id = ? AND tm.team_id = event.team_id
+        JOIN users player ON player.id = tm.user_id
+        JOIN guardian_players gp ON gp.player_id = player.id AND gp.guardian_id = ?
+        WHERE event.id = ? AND event.team_id = ? AND player.role = 'player' AND player.${excluded} = 0`,
+    [playerId, guardianId, eventId, req.user.teamId], (err, eligibleAssignment) => {
+        if (err || !eligibleAssignment) return res.status(400).json({ error: 'Deze ouder/verzorger kan deze taak niet uitvoeren.' });
+        db.run('DELETE FROM duties WHERE event_id = ? AND type = ?', [eventId, type], deleteErr => {
+            if (deleteErr) return res.status(400).json({ error: deleteErr.message });
+            db.run('INSERT INTO duties (event_id, user_id, guardian_id, type, note) VALUES (?, ?, ?, ?, ?)',
+                [eventId, playerId, guardianId, type, 'Handmatig ingedeeld'], insertErr => {
+                    if (insertErr) return res.status(400).json({ error: insertErr.message });
+                    sendQuery(dutyQuery, [req.user.teamId], res);
+                });
         });
     });
 });

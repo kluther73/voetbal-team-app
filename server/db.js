@@ -24,6 +24,11 @@ db.serialize(() => {
         user_id INTEGER NOT NULL,
         PRIMARY KEY (team_id, user_id)
     )`);
+    db.run(`CREATE TABLE IF NOT EXISTS guardian_players (
+        guardian_id INTEGER NOT NULL,
+        player_id INTEGER NOT NULL,
+        PRIMARY KEY (guardian_id, player_id)
+    )`);
     db.run(`CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT NOT NULL,
@@ -49,10 +54,12 @@ db.serialize(() => {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
+        guardian_id INTEGER,
         type TEXT NOT NULL,
         note TEXT,
         UNIQUE(event_id, user_id, type)
     )`);
+    db.run('ALTER TABLE duties ADD COLUMN guardian_id INTEGER', () => {});
     db.run(`CREATE TABLE IF NOT EXISTS surveys (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         question TEXT NOT NULL,
@@ -76,40 +83,57 @@ db.serialize(() => {
     db.run("UPDATE users SET email = CASE name WHEN 'Sjaak Afhaak' THEN 'sjaak@team.nl' WHEN 'Piet Precies' THEN 'piet@team.nl' WHEN 'Klaas Vaak' THEN 'klaas@team.nl' ELSE email END WHERE email IS NULL");
     db.run('UPDATE users SET password_hash = ? WHERE password_hash IS NULL', [bcrypt.hashSync('voetbal123', 10)]);
     
-    db.run("INSERT INTO teams (name, club) SELECT 'JO13-1', 'RoodWit' WHERE NOT EXISTS (SELECT 1 FROM teams)");
-    
-    // Seed users if empty
-    const password_hash = bcrypt.hashSync('voetbal123', 10);
-    db.run("DELETE FROM users WHERE id > 0", () => {
-        const seedUsers = [
-            ['Sjaak Afhaak', 'player', 'sjaak@team.nl', password_hash, 0, 0],
-            ['Piet Precies', 'player', 'piet@team.nl', password_hash, 0, 0],
-            ['Klaas Vaak', 'player', 'klaas@team.nl', password_hash, 1, 0],
-            ['Anne Coach', 'team-manager', 'anne@team.nl', password_hash, 0, 0],
-            ['Marco Trainer', 'trainer', 'marco@team.nl', password_hash, 0, 0],
-            ['Opa Jan', 'guardian', 'jan@team.nl', password_hash, 0, 0]
-        ];
-        const stmt = db.prepare('INSERT INTO users (name, role, email, password_hash, exclude_driving, exclude_flagging) VALUES (?, ?, ?, ?, ?, ?)');
-        seedUsers.forEach(user => stmt.run(user));
-        stmt.finalize(() => {
-            // After users are seeded, add them to team_members
-            db.run("DELETE FROM team_members WHERE team_id > 0");
-            db.run("INSERT OR IGNORE INTO team_members (team_id, user_id) SELECT (SELECT id FROM teams LIMIT 1), id FROM users");
+    db.run("INSERT INTO teams (name, club) SELECT 'JO13-1', 'RoodWit' WHERE NOT EXISTS (SELECT 1 FROM teams)", () => {
+        db.get('SELECT id FROM teams LIMIT 1', (teamErr, team) => {
+            if (teamErr || !team) return;
+            const passwordHash = bcrypt.hashSync('voetbal123', 10);
+            const seedUsers = [
+                ['Sjaak Afhaak', 'player', 'sjaak@team.nl', passwordHash, 0, 0],
+                ['Piet Precies', 'player', 'piet@team.nl', passwordHash, 0, 0],
+                ['Klaas Vaak', 'player', 'klaas@team.nl', passwordHash, 1, 0],
+                ['Anne Coach', 'team-manager', 'anne@team.nl', passwordHash, 0, 0],
+                ['Marco Trainer', 'trainer', 'marco@team.nl', passwordHash, 0, 0],
+                ['Opa Jan', 'guardian', 'jan@team.nl', passwordHash, 0, 0],
+                ['Maaike Precies', 'guardian', 'maaike@team.nl', passwordHash, 0, 0],
+                ['Fatima Vaak', 'guardian', 'fatima@team.nl', passwordHash, 0, 0]
+            ];
+            const events = [
+                ['match', 'Uitwedstrijd JO13-1', '2026-08-30', '10:00', 'Sportpark De Brug', 'SV Rivierwijk'],
+                ['training', 'Training', '2026-08-27', '18:30', 'Veld 2', null],
+                ['match', 'Thuiswedstrijd JO13-1', '2026-09-06', '09:30', 'Sportpark Zuid', 'FC Horizon']
+            ];
+
+            db.run('DELETE FROM attendance', () => db.run('DELETE FROM duties', () => db.run('DELETE FROM events', () =>
+                db.run('DELETE FROM guardian_players', () => db.run('DELETE FROM team_members', () => db.run('DELETE FROM users', () => {
+                    const usersStatement = db.prepare('INSERT INTO users (name, role, email, password_hash, exclude_driving, exclude_flagging) VALUES (?, ?, ?, ?, ?, ?)');
+                    seedUsers.forEach(user => usersStatement.run(user));
+                    usersStatement.finalize(() => {
+                        db.run('INSERT INTO team_members (team_id, user_id) SELECT ?, id FROM users', [team.id], () => {
+                            db.run(`INSERT INTO guardian_players (guardian_id, player_id)
+                                SELECT guardian.id, player.id
+                                FROM users guardian JOIN users player
+                                WHERE (guardian.email = 'jan@team.nl' AND player.email = 'sjaak@team.nl')
+                                    OR (guardian.email = 'maaike@team.nl' AND player.email = 'piet@team.nl')
+                                    OR (guardian.email = 'fatima@team.nl' AND player.email = 'klaas@team.nl')`, () => {
+                                const eventsStatement = db.prepare('INSERT INTO events (type, title, date, time, location, opponent, team_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
+                                events.forEach(event => eventsStatement.run([...event, team.id]));
+                                eventsStatement.finalize(() => {
+                                    db.run(`INSERT INTO attendance (event_id, user_id, status, responded_at)
+                                        SELECT event.id, player.id, 'present', datetime('now')
+                                        FROM events event
+                                        JOIN team_members tm ON tm.team_id = event.team_id
+                                        JOIN users player ON player.id = tm.user_id AND player.role = 'player'
+                                        WHERE event.team_id = ?`, [team.id], () => {
+                                        db.run('DELETE FROM surveys', () => {
+                                            db.run("INSERT INTO surveys (question, deadline, responses, total) VALUES ('Wie kan er mee naar het teamweekend?', '2026-09-02', 8, 12)");
+                                        });
+                                    });
+                                });
+                            });
+                        });
+                    });
+                }))))));
         });
-    });
-    
-    db.run('UPDATE events SET team_id = (SELECT id FROM teams LIMIT 1) WHERE team_id IS NULL');
-    
-    // Seed events if empty
-    db.run("DELETE FROM events WHERE id > 0", () => {
-        db.run("INSERT INTO events (type, title, date, time, location, opponent, team_id) VALUES ('match', 'Uitwedstrijd JO13-1', '2026-08-30', '10:00', 'Sportpark De Brug', 'SV Rivierwijk', (SELECT id FROM teams LIMIT 1))");
-        db.run("INSERT INTO events (type, title, date, time, location, team_id) VALUES ('training', 'Training', '2026-08-27', '18:30', 'Veld 2', (SELECT id FROM teams LIMIT 1))");
-        db.run("INSERT INTO events (type, title, date, time, location, opponent, team_id) VALUES ('match', 'Thuiswedstrijd JO13-1', '2026-09-06', '09:30', 'Sportpark Zuid', 'FC Horizon', (SELECT id FROM teams LIMIT 1))");
-    });
-    
-    // Seed surveys if empty
-    db.run("DELETE FROM surveys WHERE id > 0", () => {
-        db.run("INSERT INTO surveys (question, deadline, responses, total) VALUES ('Wie kan er mee naar het teamweekend?', '2026-09-02', 8, 12)");
     });
 });
 
