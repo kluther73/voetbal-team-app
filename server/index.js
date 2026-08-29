@@ -6,6 +6,7 @@ const path = require('path');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { encrypt, decrypt } = require('./secret');
 
 const app = express();
 const JWT_SECRET = process.env.JWT_SECRET || 'development-only-change-this-secret';
@@ -100,6 +101,11 @@ const parseCsv = csv => {
     return lines.slice(1).map(line => Object.fromEntries(parseLine(line).map((value, index) => [headers[index], value])));
 };
 
+const integrationConfig = async teamId => {
+    const config = await get('SELECT * FROM voetbalnl_integrations WHERE team_id = ?', [teamId]);
+    return config ? { ...config, accessToken: decrypt(config.access_token_encrypted) } : null;
+};
+
 // Serveer de frontend bestanden uit de 'public' map
 app.use(express.static(path.join(__dirname, '../public')));
 
@@ -143,12 +149,53 @@ const allow = (...roles) => (req, res, next) => {
 app.use('/api', authenticate);
 
 app.get('/api/integrations/voetbalnl', allow('team-manager'), (req, res) => {
-    res.json({ configured: voetbalNl.configured(), teamId: process.env.VOETBAL_NL_TEAM_ID || null });
+    db.get(`SELECT t.name, t.club, integration.official_team_id, integration.matches_url, integration.trainings_url,
+        integration.players_url, integration.other_fixtures_url, integration.access_token_encrypted
+        FROM teams t LEFT JOIN voetbalnl_integrations integration ON integration.team_id = t.id WHERE t.id = ?`, [req.user.teamId], (err, settings) => {
+        if (err || !settings) return res.status(404).json({ error: 'Team niet gevonden.' });
+        res.json({
+            name: settings.name,
+            club: settings.club,
+            officialTeamId: settings.official_team_id || '',
+            matchesUrl: settings.matches_url || '',
+            trainingsUrl: settings.trainings_url || '',
+            playersUrl: settings.players_url || '',
+            otherFixturesUrl: settings.other_fixtures_url || '',
+            tokenConfigured: Boolean(settings.access_token_encrypted),
+            configured: voetbalNl.configured({
+                official_team_id: settings.official_team_id,
+                matches_url: settings.matches_url,
+                trainings_url: settings.trainings_url,
+                players_url: settings.players_url
+            })
+        });
+    });
+});
+
+app.post('/api/integrations/voetbalnl', allow('team-manager'), async (req, res) => {
+    const { name, officialTeamId, matchesUrl, trainingsUrl, playersUrl, otherFixturesUrl, accessToken } = req.body;
+    if (!String(name || '').trim()) return res.status(400).json({ error: 'Vul een teamnaam in.' });
+    const urls = [matchesUrl, trainingsUrl, playersUrl, otherFixturesUrl].filter(Boolean);
+    if (urls.some(url => !/^https:\/\//i.test(url))) return res.status(400).json({ error: 'Gebruik een volledige https URL voor ieder endpoint.' });
+    try {
+        const existing = await get('SELECT access_token_encrypted FROM voetbalnl_integrations WHERE team_id = ?', [req.user.teamId]);
+        const encryptedToken = accessToken ? encrypt(accessToken) : existing?.access_token_encrypted || null;
+        await run('UPDATE teams SET name = ? WHERE id = ?', [name.trim(), req.user.teamId]);
+        await run(`INSERT INTO voetbalnl_integrations (team_id, official_team_id, matches_url, trainings_url, players_url, other_fixtures_url, access_token_encrypted, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(team_id) DO UPDATE SET official_team_id = excluded.official_team_id, matches_url = excluded.matches_url,
+                trainings_url = excluded.trainings_url, players_url = excluded.players_url, other_fixtures_url = excluded.other_fixtures_url,
+                access_token_encrypted = excluded.access_token_encrypted, updated_at = excluded.updated_at`,
+        [req.user.teamId, officialTeamId || null, matchesUrl || null, trainingsUrl || null, playersUrl || null, otherFixturesUrl || null, encryptedToken]);
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'Instellingen opslaan mislukt.' });
+    }
 });
 
 app.post('/api/integrations/voetbalnl/sync', allow('team-manager'), async (req, res) => {
     try {
-        const data = await voetbalNl.fetchTeamData();
+        const data = await voetbalNl.fetchTeamData(await integrationConfig(req.user.teamId));
         const summary = await importTeamData(req.user.teamId, {
             players: data.players,
             events: [...data.matches.map(match => ({ ...match, type: 'match' })), ...data.trainings.map(training => ({ ...training, type: 'training' }))],

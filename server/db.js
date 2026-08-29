@@ -84,6 +84,16 @@ db.serialize(() => {
         is_away INTEGER NOT NULL DEFAULT 0,
         UNIQUE(team_id, source_external_id)
     )`);
+    db.run(`CREATE TABLE IF NOT EXISTS voetbalnl_integrations (
+        team_id INTEGER PRIMARY KEY,
+        official_team_id TEXT,
+        matches_url TEXT,
+        trainings_url TEXT,
+        players_url TEXT,
+        other_fixtures_url TEXT,
+        access_token_encrypted TEXT,
+        updated_at TEXT
+    )`);
 
     // Bring the original starter database forward without losing its data.
     db.run('ALTER TABLE users ADD COLUMN email TEXT', () => {});

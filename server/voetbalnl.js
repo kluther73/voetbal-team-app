@@ -1,10 +1,10 @@
-const replaceTeamId = value => value.replaceAll('{teamId}', encodeURIComponent(process.env.VOETBAL_NL_TEAM_ID || ''));
+const replaceTeamId = (value, teamId) => value.replaceAll('{teamId}', encodeURIComponent(teamId || ''));
 
-const getCollection = async url => {
-    const response = await fetch(replaceTeamId(url), {
+const getCollection = async (url, config) => {
+    const response = await fetch(replaceTeamId(url, config.official_team_id), {
         headers: {
             Accept: 'application/json',
-            ...(process.env.VOETBAL_NL_ACCESS_TOKEN ? { Authorization: `Bearer ${process.env.VOETBAL_NL_ACCESS_TOKEN}` } : {})
+            ...(config.accessToken ? { Authorization: `Bearer ${config.accessToken}` } : {})
         }
     });
     if (!response.ok) throw new Error(`voetbal.nl gaf HTTP ${response.status}.`);
@@ -12,20 +12,20 @@ const getCollection = async url => {
     return Array.isArray(payload) ? payload : payload.data || payload.items || [];
 };
 
-const configured = () => Boolean(
-    process.env.VOETBAL_NL_TEAM_ID &&
-    process.env.VOETBAL_NL_MATCHES_URL &&
-    process.env.VOETBAL_NL_TRAININGS_URL &&
-    process.env.VOETBAL_NL_PLAYERS_URL
+const configured = config => Boolean(
+    config?.official_team_id &&
+    config?.matches_url &&
+    config?.trainings_url &&
+    config?.players_url
 );
 
-const fetchTeamData = async () => {
-    if (!configured()) throw new Error('De voetbal.nl API is nog niet geconfigureerd.');
+const fetchTeamData = async config => {
+    if (!configured(config)) throw new Error('De voetbal.nl API is nog niet volledig geconfigureerd.');
     const [matches, trainings, players, otherFixtures] = await Promise.all([
-        getCollection(process.env.VOETBAL_NL_MATCHES_URL),
-        getCollection(process.env.VOETBAL_NL_TRAININGS_URL),
-        getCollection(process.env.VOETBAL_NL_PLAYERS_URL),
-        process.env.VOETBAL_NL_OTHER_FIXTURES_URL ? getCollection(process.env.VOETBAL_NL_OTHER_FIXTURES_URL) : Promise.resolve([])
+        getCollection(config.matches_url, config),
+        getCollection(config.trainings_url, config),
+        getCollection(config.players_url, config),
+        config.other_fixtures_url ? getCollection(config.other_fixtures_url, config) : Promise.resolve([])
     ]);
     return { matches, trainings, players, otherFixtures };
 };

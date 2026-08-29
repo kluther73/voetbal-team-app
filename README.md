@@ -9,9 +9,11 @@ npm start
 
 ## voetbal.nl-integratie
 
-De team-manager beheert de koppeling via **Vereniging**. De applicatie ondersteunt twee importpaden:
+De team-manager beheert de koppeling via **Instellingen**. Vul daar de teamnaam, officiële team-id, endpoints en het access token in. Het token wordt versleuteld in de lokale database opgeslagen en komt niet terug naar de browser. Maak voor productie een `.env` met een stabiele `INTEGRATION_ENCRYPTION_KEY`; zie [.env.example](.env.example).
 
-- **Officiële API**: kopieer `.env.example` naar `.env` en vul de door KNVB/voetbal.nl verstrekte team-id, access token en feed-URL's in. De JSON-feeds mogen een array zijn of een object met `data` of `items`.
+De applicatie ondersteunt twee importpaden:
+
+- **Officiële API**: vul de door KNVB/voetbal.nl verstrekte team-id, access token en feed-URL's in via **Instellingen**. De JSON-feeds mogen een array zijn of een object met `data` of `items`.
 - **CSV-back-up**: kies in de app een CSV-bestand met de volgende kopregel:
 
 ```csv
