@@ -149,6 +149,7 @@ db.serialize(() => {
     db.run('ALTER TABLE users ADD COLUMN last_name TEXT', () => {});
     db.run('ALTER TABLE users ADD COLUMN phone TEXT', () => {});
     db.run('ALTER TABLE users ADD COLUMN birth_date TEXT', () => {});
+    db.run('ALTER TABLE users ADD COLUMN jersey_number INTEGER', () => {});
     db.run("UPDATE events SET is_away = 1 WHERE title LIKE 'Uitwedstrijd%'");
     db.run("UPDATE events SET title = COALESCE(title, 'Wedstrijd'), type = COALESCE(type, 'match') WHERE title IS NULL OR type IS NULL");
     db.run("UPDATE users SET email = CASE name WHEN 'Sjaak Afhaak' THEN 'sjaak@team.nl' WHEN 'Piet Precies' THEN 'piet@team.nl' WHEN 'Klaas Vaak' THEN 'klaas@team.nl' ELSE email END WHERE email IS NULL");

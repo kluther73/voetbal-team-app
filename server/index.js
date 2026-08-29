@@ -190,7 +190,7 @@ app.post('/api/admin/teams', allow('admin'), async (req, res) => {
 
 app.get('/api/team-members', allow('team-manager'), async (req, res) => {
     try {
-        const members = await rows(`SELECT u.id, u.name, u.first_name, u.last_name, u.email, u.phone, u.birth_date, u.role,
+        const members = await rows(`SELECT u.id, u.name, u.first_name, u.last_name, u.email, u.phone, u.birth_date, u.jersey_number, u.role,
                 gp.player_id, player.name AS player_name,
                 GROUP_CONCAT(pos.id) AS position_ids, GROUP_CONCAT(pos.name) AS position_names
             FROM users u
@@ -220,6 +220,16 @@ const validateProfileFields = ({ firstName, lastName, email, phone, birthDate })
     return null;
 };
 
+const validateJerseyNumber = async (teamId, jerseyNumber, excludeMemberId) => {
+    if (jerseyNumber === undefined || jerseyNumber === null || jerseyNumber === '') return { value: null };
+    const number = Number(jerseyNumber);
+    if (!Number.isInteger(number) || number < 1 || number > 99) return { error: 'Vul een rugnummer tussen 1 en 99 in.' };
+    const duplicate = await get(`SELECT u.id FROM users u JOIN team_members tm ON tm.user_id = u.id
+        WHERE tm.team_id = ? AND u.role = 'player' AND u.jersey_number = ? AND u.id != ?`, [teamId, number, excludeMemberId || 0]);
+    if (duplicate) return { error: 'Dit rugnummer is al in gebruik binnen het team.' };
+    return { value: number };
+};
+
 const setPlayerPositions = async (playerId, teamId, positionIds) => {
     const ids = Array.isArray(positionIds) ? [...new Set(positionIds.map(Number))].filter(Number.isInteger) : [];
     await run('DELETE FROM player_positions WHERE player_id = ?', [playerId]);
@@ -232,7 +242,7 @@ const setPlayerPositions = async (playerId, teamId, positionIds) => {
 };
 
 app.post('/api/team-members', allow('team-manager'), async (req, res) => {
-    const { role, firstName, lastName, email, phone, birthDate, password, playerId, positionIds } = req.body;
+    const { role, firstName, lastName, email, phone, birthDate, jerseyNumber, password, playerId, positionIds } = req.body;
     if (!['player', 'guardian', 'trainer'].includes(role)) return res.status(400).json({ error: 'Kies een geldige rol.' });
     const validationError = validateProfileFields({ firstName, lastName, email, phone, birthDate });
     if (validationError) return res.status(400).json({ error: validationError });
@@ -243,10 +253,16 @@ app.post('/api/team-members', allow('team-manager'), async (req, res) => {
                 WHERE u.id = ? AND tm.team_id = ? AND u.role = 'player'`, [playerId, req.user.teamId]);
             if (!player) return res.status(400).json({ error: 'Kies een speler voor deze ouder/verzorger.' });
         }
+        let jerseyNumberValue = null;
+        if (role === 'player') {
+            const jerseyResult = await validateJerseyNumber(req.user.teamId, jerseyNumber);
+            if (jerseyResult.error) return res.status(400).json({ error: jerseyResult.error });
+            jerseyNumberValue = jerseyResult.value;
+        }
         const existing = await get('SELECT id FROM users WHERE email = ?', [email.trim().toLowerCase()]);
         if (existing) return res.status(400).json({ error: 'Dit e-mailadres is al in gebruik.' });
-        const member = await run('INSERT INTO users (name, first_name, last_name, role, email, phone, birth_date, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [fullName(firstName, lastName), firstName.trim(), lastName.trim(), role, email.trim().toLowerCase(), phone?.trim() || null, birthDate || null, bcrypt.hashSync(password, 10)]);
+        const member = await run('INSERT INTO users (name, first_name, last_name, role, email, phone, birth_date, jersey_number, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [fullName(firstName, lastName), firstName.trim(), lastName.trim(), role, email.trim().toLowerCase(), phone?.trim() || null, birthDate || null, jerseyNumberValue, bcrypt.hashSync(password, 10)]);
         await run('INSERT INTO team_members (team_id, user_id) VALUES (?, ?)', [req.user.teamId, member.lastID]);
         if (role === 'guardian') await run('INSERT INTO guardian_players (guardian_id, player_id) VALUES (?, ?)', [member.lastID, playerId]);
         if (role === 'player') await setPlayerPositions(member.lastID, req.user.teamId, positionIds);
@@ -258,7 +274,7 @@ app.post('/api/team-members', allow('team-manager'), async (req, res) => {
 
 app.put('/api/team-members/:memberId', allow('team-manager'), async (req, res) => {
     const memberId = Number(req.params.memberId);
-    const { firstName, lastName, email, phone, birthDate, password, playerId, positionIds } = req.body;
+    const { firstName, lastName, email, phone, birthDate, jerseyNumber, password, playerId, positionIds } = req.body;
     const validationError = validateProfileFields({ firstName, lastName, email, phone, birthDate });
     if (validationError) return res.status(400).json({ error: validationError });
     if (password && String(password).length < 8) return res.status(400).json({ error: 'Het nieuwe wachtwoord moet minimaal 8 tekens hebben.' });
@@ -275,9 +291,15 @@ app.put('/api/team-members/:memberId', allow('team-manager'), async (req, res) =
             await run('DELETE FROM guardian_players WHERE guardian_id = ?', [memberId]);
             await run('INSERT INTO guardian_players (guardian_id, player_id) VALUES (?, ?)', [memberId, playerId]);
         }
-        if (member.role === 'player') await setPlayerPositions(memberId, req.user.teamId, positionIds);
-        await run('UPDATE users SET name = ?, first_name = ?, last_name = ?, email = ?, phone = ?, birth_date = ? WHERE id = ?',
-            [fullName(firstName, lastName), firstName.trim(), lastName.trim(), email.trim().toLowerCase(), phone?.trim() || null, birthDate || null, memberId]);
+        let jerseyNumberValue = null;
+        if (member.role === 'player') {
+            const jerseyResult = await validateJerseyNumber(req.user.teamId, jerseyNumber, memberId);
+            if (jerseyResult.error) return res.status(400).json({ error: jerseyResult.error });
+            jerseyNumberValue = jerseyResult.value;
+            await setPlayerPositions(memberId, req.user.teamId, positionIds);
+        }
+        await run('UPDATE users SET name = ?, first_name = ?, last_name = ?, email = ?, phone = ?, birth_date = ?, jersey_number = ? WHERE id = ?',
+            [fullName(firstName, lastName), firstName.trim(), lastName.trim(), email.trim().toLowerCase(), phone?.trim() || null, birthDate || null, member.role === 'player' ? jerseyNumberValue : null, memberId]);
         if (password) await run('UPDATE users SET password_hash = ? WHERE id = ?', [bcrypt.hashSync(password, 10), memberId]);
         res.json({ ok: true });
     } catch (error) {
