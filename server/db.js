@@ -116,6 +116,17 @@ db.serialize(() => {
         access_token_encrypted TEXT,
         updated_at TEXT
     )`);
+    db.run(`CREATE TABLE IF NOT EXISTS positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        UNIQUE(team_id, name)
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS player_positions (
+        player_id INTEGER NOT NULL,
+        position_id INTEGER NOT NULL,
+        PRIMARY KEY (player_id, position_id)
+    )`);
 
     // Bring the original starter database forward without losing its data.
     db.run('ALTER TABLE users ADD COLUMN email TEXT', () => {});
@@ -134,16 +145,24 @@ db.serialize(() => {
     db.run('ALTER TABLE surveys ADD COLUMN team_id INTEGER', () => {});
     db.run("ALTER TABLE surveys ADD COLUMN target_audience TEXT NOT NULL DEFAULT 'both'", () => {});
     db.run('ALTER TABLE surveys ADD COLUMN title TEXT', () => {});
+    db.run('ALTER TABLE users ADD COLUMN first_name TEXT', () => {});
+    db.run('ALTER TABLE users ADD COLUMN last_name TEXT', () => {});
+    db.run('ALTER TABLE users ADD COLUMN phone TEXT', () => {});
+    db.run('ALTER TABLE users ADD COLUMN birth_date TEXT', () => {});
     db.run("UPDATE events SET is_away = 1 WHERE title LIKE 'Uitwedstrijd%'");
     db.run("UPDATE events SET title = COALESCE(title, 'Wedstrijd'), type = COALESCE(type, 'match') WHERE title IS NULL OR type IS NULL");
     db.run("UPDATE users SET email = CASE name WHEN 'Sjaak Afhaak' THEN 'sjaak@team.nl' WHEN 'Piet Precies' THEN 'piet@team.nl' WHEN 'Klaas Vaak' THEN 'klaas@team.nl' ELSE email END WHERE email IS NULL");
     db.run('UPDATE users SET password_hash = ? WHERE password_hash IS NULL', [bcrypt.hashSync('voetbal123', 10)]);
+    db.run(`UPDATE users SET first_name = COALESCE(first_name, CASE WHEN instr(name, ' ') > 0 THEN substr(name, 1, instr(name, ' ') - 1) ELSE name END)`);
+    db.run(`UPDATE users SET last_name = COALESCE(last_name, CASE WHEN instr(name, ' ') > 0 THEN substr(name, instr(name, ' ') + 1) ELSE '' END)`);
     
     db.get('SELECT COUNT(*) AS count FROM users', (existingErr, existingUsers) => {
         if (existingErr || existingUsers.count > 0) return;
         db.run("INSERT INTO teams (name, club) SELECT 'JO13-1', 'RoodWit' WHERE NOT EXISTS (SELECT 1 FROM teams)", () => {
         db.get('SELECT id FROM teams LIMIT 1', (teamErr, team) => {
             if (teamErr || !team) return;
+            db.run('INSERT OR IGNORE INTO positions (team_id, name) VALUES (?, ?), (?, ?), (?, ?), (?, ?)',
+                [team.id, 'Keeper', team.id, 'Verdediger', team.id, 'Middenvelder', team.id, 'Aanvaller']);
             const passwordHash = bcrypt.hashSync('voetbal123', 10);
             const seedUsers = [
                 ['Sjaak Afhaak', 'player', 'sjaak@team.nl', passwordHash, 0, 0],

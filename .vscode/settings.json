@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd /workspaces/voetbal-team-app && python3 -c \"\ncontent = open\\('public/index\\.html', encoding='utf-8'\\)\\.read\\(\\)\ndef extract\\(start_marker, end_marker\\):\n    start = content\\.index\\(start_marker\\)\n    end = content\\.index\\(end_marker, start\\)\n    return content\\[start:end\\]\nprint\\('---renderTeamMembers---'\\)\nprint\\(extract\\('function renderTeamMembers\\(\\)', 'function loadTeamMembers\\(\\)'\\)\\)\nprint\\('---loadTeamMembers/createMember/editMember/deleteMember---'\\)\nprint\\(extract\\('function loadTeamMembers\\(\\)', 'function loadDashboard\\(\\)'\\)\\)\n\"\n$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

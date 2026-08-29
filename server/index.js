@@ -27,6 +27,9 @@ const rows = (sql, params = []) => new Promise((resolve, reject) => db.all(sql, 
 
 const field = (record, ...names) => names.map(name => record[name]).find(value => value !== undefined && value !== null && value !== '');
 const isTrue = value => value === true || ['1', 'true', 'ja', 'yes', 'uit'].includes(String(value).toLowerCase());
+const fullName = (firstName, lastName) => [firstName, lastName].filter(Boolean).join(' ').trim();
+const isValidPhone = value => /^[0-9+\-\s()]{6,20}$/.test(value);
+const isValidBirthDate = value => /^\d{4}-\d{2}-\d{2}$/.test(value);
 
 const addAttendance = async (eventId, teamId) => {
     await run(`INSERT OR IGNORE INTO attendance (event_id, user_id, status, responded_at)
@@ -185,21 +188,55 @@ app.post('/api/admin/teams', allow('admin'), async (req, res) => {
     }
 });
 
-app.get('/api/team-members', allow('team-manager'), (req, res) => {
-    sendQuery(`SELECT u.id, u.name, u.email, u.role, gp.player_id, player.name AS player_name
-        FROM users u
-        JOIN team_members tm ON tm.user_id = u.id
-        LEFT JOIN guardian_players gp ON gp.guardian_id = u.id
-        LEFT JOIN users player ON player.id = gp.player_id
-        WHERE tm.team_id = ? AND u.role IN ('player', 'guardian', 'trainer')
-        ORDER BY CASE u.role WHEN 'player' THEN 1 WHEN 'guardian' THEN 2 ELSE 3 END, u.name`, [req.user.teamId], res);
+app.get('/api/team-members', allow('team-manager'), async (req, res) => {
+    try {
+        const members = await rows(`SELECT u.id, u.name, u.first_name, u.last_name, u.email, u.phone, u.birth_date, u.role,
+                gp.player_id, player.name AS player_name,
+                GROUP_CONCAT(pos.id) AS position_ids, GROUP_CONCAT(pos.name) AS position_names
+            FROM users u
+            JOIN team_members tm ON tm.user_id = u.id
+            LEFT JOIN guardian_players gp ON gp.guardian_id = u.id
+            LEFT JOIN users player ON player.id = gp.player_id
+            LEFT JOIN player_positions pp ON pp.player_id = u.id
+            LEFT JOIN positions pos ON pos.id = pp.position_id
+            WHERE tm.team_id = ? AND u.role IN ('player', 'guardian', 'trainer')
+            GROUP BY u.id
+            ORDER BY CASE u.role WHEN 'player' THEN 1 WHEN 'guardian' THEN 2 ELSE 3 END, u.name`, [req.user.teamId]);
+        res.json(members.map(member => ({
+            ...member,
+            position_ids: member.position_ids ? member.position_ids.split(',').map(Number) : [],
+            position_names: member.position_names ? member.position_names.split(',') : []
+        })));
+    } catch (error) {
+        res.status(400).json({ error: error.message });
+    }
 });
 
+const validateProfileFields = ({ firstName, lastName, email, phone, birthDate }) => {
+    if (![firstName, lastName, email].every(value => String(value || '').trim())) return 'Vul voornaam, achternaam en e-mailadres in.';
+    if (!/^\S+@\S+\.\S+$/.test(email)) return 'Vul een geldig e-mailadres in.';
+    if (phone && !isValidPhone(phone)) return 'Vul een geldig telefoonnummer in.';
+    if (birthDate && !isValidBirthDate(birthDate)) return 'Vul een geboortedatum in als JJJJ-MM-DD.';
+    return null;
+};
+
+const setPlayerPositions = async (playerId, teamId, positionIds) => {
+    const ids = Array.isArray(positionIds) ? [...new Set(positionIds.map(Number))].filter(Number.isInteger) : [];
+    await run('DELETE FROM player_positions WHERE player_id = ?', [playerId]);
+    if (!ids.length) return;
+    const validPositions = await rows(`SELECT id FROM positions WHERE team_id = ? AND id IN (${ids.map(() => '?').join(',')})`, [teamId, ...ids]);
+    if (validPositions.length !== ids.length) throw new Error('Kies alleen posities van dit team.');
+    const statement = db.prepare('INSERT INTO player_positions (player_id, position_id) VALUES (?, ?)');
+    ids.forEach(positionId => statement.run([playerId, positionId]));
+    await new Promise((resolve, reject) => statement.finalize(err => err ? reject(err) : resolve()));
+};
+
 app.post('/api/team-members', allow('team-manager'), async (req, res) => {
-    const { name, email, role, password, playerId } = req.body;
+    const { role, firstName, lastName, email, phone, birthDate, password, playerId, positionIds } = req.body;
     if (!['player', 'guardian', 'trainer'].includes(role)) return res.status(400).json({ error: 'Kies een geldige rol.' });
-    if (![name, email, password].every(value => String(value || '').trim())) return res.status(400).json({ error: 'Vul naam, e-mailadres en tijdelijk wachtwoord in.' });
-    if (!/^\S+@\S+\.\S+$/.test(email) || String(password).length < 8) return res.status(400).json({ error: 'Vul een geldig e-mailadres en een wachtwoord van minimaal 8 tekens in.' });
+    const validationError = validateProfileFields({ firstName, lastName, email, phone, birthDate });
+    if (validationError) return res.status(400).json({ error: validationError });
+    if (!String(password || '').trim() || String(password).length < 8) return res.status(400).json({ error: 'Vul een tijdelijk wachtwoord van minimaal 8 tekens in.' });
     try {
         if (role === 'guardian') {
             const player = await get(`SELECT u.id FROM users u JOIN team_members tm ON tm.user_id = u.id
@@ -208,9 +245,11 @@ app.post('/api/team-members', allow('team-manager'), async (req, res) => {
         }
         const existing = await get('SELECT id FROM users WHERE email = ?', [email.trim().toLowerCase()]);
         if (existing) return res.status(400).json({ error: 'Dit e-mailadres is al in gebruik.' });
-        const member = await run('INSERT INTO users (name, role, email, password_hash) VALUES (?, ?, ?, ?)', [name.trim(), role, email.trim().toLowerCase(), bcrypt.hashSync(password, 10)]);
+        const member = await run('INSERT INTO users (name, first_name, last_name, role, email, phone, birth_date, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [fullName(firstName, lastName), firstName.trim(), lastName.trim(), role, email.trim().toLowerCase(), phone?.trim() || null, birthDate || null, bcrypt.hashSync(password, 10)]);
         await run('INSERT INTO team_members (team_id, user_id) VALUES (?, ?)', [req.user.teamId, member.lastID]);
         if (role === 'guardian') await run('INSERT INTO guardian_players (guardian_id, player_id) VALUES (?, ?)', [member.lastID, playerId]);
+        if (role === 'player') await setPlayerPositions(member.lastID, req.user.teamId, positionIds);
         res.status(201).json({ id: member.lastID });
     } catch (error) {
         res.status(400).json({ error: error.message || 'Teamlid toevoegen mislukt.' });
@@ -219,11 +258,14 @@ app.post('/api/team-members', allow('team-manager'), async (req, res) => {
 
 app.put('/api/team-members/:memberId', allow('team-manager'), async (req, res) => {
     const memberId = Number(req.params.memberId);
-    const { name, email, playerId } = req.body;
+    const { firstName, lastName, email, phone, birthDate, password, playerId, positionIds } = req.body;
+    const validationError = validateProfileFields({ firstName, lastName, email, phone, birthDate });
+    if (validationError) return res.status(400).json({ error: validationError });
+    if (password && String(password).length < 8) return res.status(400).json({ error: 'Het nieuwe wachtwoord moet minimaal 8 tekens hebben.' });
     try {
         const member = await get(`SELECT u.id, u.role FROM users u JOIN team_members tm ON tm.user_id = u.id
             WHERE u.id = ? AND tm.team_id = ? AND u.role IN ('player', 'guardian', 'trainer')`, [memberId, req.user.teamId]);
-        if (!member || !String(name || '').trim() || !/^\S+@\S+\.\S+$/.test(email || '')) return res.status(400).json({ error: 'Vul een geldige naam en e-mailadres in.' });
+        if (!member) return res.status(404).json({ error: 'Teamlid niet gevonden.' });
         const duplicate = await get('SELECT id FROM users WHERE email = ? AND id != ?', [email.trim().toLowerCase(), memberId]);
         if (duplicate) return res.status(400).json({ error: 'Dit e-mailadres is al in gebruik.' });
         if (member.role === 'guardian') {
@@ -233,7 +275,10 @@ app.put('/api/team-members/:memberId', allow('team-manager'), async (req, res) =
             await run('DELETE FROM guardian_players WHERE guardian_id = ?', [memberId]);
             await run('INSERT INTO guardian_players (guardian_id, player_id) VALUES (?, ?)', [memberId, playerId]);
         }
-        await run('UPDATE users SET name = ?, email = ? WHERE id = ?', [name.trim(), email.trim().toLowerCase(), memberId]);
+        if (member.role === 'player') await setPlayerPositions(memberId, req.user.teamId, positionIds);
+        await run('UPDATE users SET name = ?, first_name = ?, last_name = ?, email = ?, phone = ?, birth_date = ? WHERE id = ?',
+            [fullName(firstName, lastName), firstName.trim(), lastName.trim(), email.trim().toLowerCase(), phone?.trim() || null, birthDate || null, memberId]);
+        if (password) await run('UPDATE users SET password_hash = ? WHERE id = ?', [bcrypt.hashSync(password, 10), memberId]);
         res.json({ ok: true });
     } catch (error) {
         res.status(400).json({ error: error.message || 'Teamlid wijzigen mislukt.' });
@@ -247,11 +292,40 @@ app.delete('/api/team-members/:memberId', allow('team-manager'), async (req, res
             WHERE u.id = ? AND tm.team_id = ? AND u.role IN ('player', 'guardian', 'trainer')`, [memberId, req.user.teamId]);
         if (!member) return res.status(404).json({ error: 'Teamlid niet gevonden.' });
         await run('DELETE FROM guardian_players WHERE guardian_id = ? OR player_id = ?', [memberId, memberId]);
+        await run('DELETE FROM player_positions WHERE player_id = ?', [memberId]);
         await run('DELETE FROM team_members WHERE team_id = ? AND user_id = ?', [req.user.teamId, memberId]);
         await run('DELETE FROM users WHERE id = ?', [memberId]);
         res.json({ ok: true });
     } catch (error) {
         res.status(400).json({ error: error.message || 'Teamlid verwijderen mislukt.' });
+    }
+});
+
+app.get('/api/positions', allow('team-manager'), (req, res) => {
+    sendQuery('SELECT id, name FROM positions WHERE team_id = ? ORDER BY name', [req.user.teamId], res);
+});
+
+app.post('/api/positions', allow('team-manager'), async (req, res) => {
+    const name = String(req.body.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'Vul een positienaam in.' });
+    try {
+        const created = await run('INSERT INTO positions (team_id, name) VALUES (?, ?)', [req.user.teamId, name]);
+        res.status(201).json({ id: created.lastID, name });
+    } catch (error) {
+        res.status(400).json({ error: error.message?.includes('UNIQUE') ? 'Deze positie bestaat al.' : (error.message || 'Positie toevoegen mislukt.') });
+    }
+});
+
+app.delete('/api/positions/:positionId', allow('team-manager'), async (req, res) => {
+    const positionId = Number(req.params.positionId);
+    try {
+        const position = await get('SELECT id FROM positions WHERE id = ? AND team_id = ?', [positionId, req.user.teamId]);
+        if (!position) return res.status(404).json({ error: 'Positie niet gevonden.' });
+        await run('DELETE FROM player_positions WHERE position_id = ?', [positionId]);
+        await run('DELETE FROM positions WHERE id = ?', [positionId]);
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'Positie verwijderen mislukt.' });
     }
 });
 
