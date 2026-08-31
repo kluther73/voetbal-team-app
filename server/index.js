@@ -119,14 +119,15 @@ app.get('/api/status', (req, res) => {
 
 app.post('/api/login', (req, res) => {
     const { email, password } = req.body;
-    db.get(`SELECT u.id, u.name, u.role, u.email, u.password_hash, tm.team_id, t.name AS team_name, t.club
+    db.get(`SELECT u.id, u.name, u.role, u.email, u.password_hash, u.club_id, tm.team_id, t.name AS team_name, t.club, c.name AS managed_club_name
         FROM users u LEFT JOIN team_members tm ON tm.user_id = u.id LEFT JOIN teams t ON t.id = tm.team_id
+        LEFT JOIN clubs c ON c.id = u.club_id
         WHERE u.email = ? LIMIT 1`, [email], (err, user) => {
         if (err) return res.status(500).json({ error: err.message });
         if (!user || !user.password_hash || !bcrypt.compareSync(password || '', user.password_hash)) {
             return res.status(401).json({ error: 'E-mailadres of wachtwoord is onjuist.' });
         }
-        const token = jwt.sign({ id: user.id, role: user.role, teamId: user.team_id }, JWT_SECRET, { expiresIn: '8h' });
+        const token = jwt.sign({ id: user.id, role: user.role, teamId: user.team_id, clubId: user.club_id }, JWT_SECRET, { expiresIn: '8h' });
         delete user.password_hash;
         res.json({ token, user });
     });
@@ -151,24 +152,59 @@ const allow = (...roles) => (req, res, next) => {
 
 app.use('/api', authenticate);
 
-app.get('/api/admin/teams', allow('admin'), (req, res) => {
+app.get('/api/admin/clubs', allow('admin'), (req, res) => {
+    sendQuery(`SELECT c.id, c.name,
+        (SELECT manager.name FROM users manager WHERE manager.club_id = c.id AND manager.role = 'club-manager' LIMIT 1) AS manager_name,
+        (SELECT manager.email FROM users manager WHERE manager.club_id = c.id AND manager.role = 'club-manager' LIMIT 1) AS manager_email,
+        (SELECT COUNT(*) FROM teams t WHERE t.club_id = c.id) AS team_count
+        FROM clubs c ORDER BY c.name`, [], res);
+});
+
+app.post('/api/admin/clubs', allow('admin'), async (req, res) => {
+    const { clubName, managerName, managerEmail, managerPassword } = req.body;
+    if (![clubName, managerName, managerEmail, managerPassword].every(value => String(value || '').trim())) {
+        return res.status(400).json({ error: 'Vul vereniging en gegevens van de clubbeheerder in.' });
+    }
+    if (!/^\S+@\S+\.\S+$/.test(managerEmail)) return res.status(400).json({ error: 'Vul een geldig e-mailadres in.' });
+    if (String(managerPassword).length < 8) return res.status(400).json({ error: 'Het wachtwoord moet minimaal 8 tekens hebben.' });
+    try {
+        const duplicateClub = await get('SELECT id FROM clubs WHERE name = ?', [clubName.trim()]);
+        if (duplicateClub) return res.status(400).json({ error: 'Deze vereniging bestaat al.' });
+        let manager = await get('SELECT id, role, club_id FROM users WHERE email = ?', [managerEmail.trim().toLowerCase()]);
+        if (manager && manager.role !== 'club-manager') return res.status(400).json({ error: 'Dit e-mailadres hoort al bij een andere rol.' });
+        if (manager && manager.club_id) return res.status(400).json({ error: 'Deze clubbeheerder is al aan een vereniging gekoppeld.' });
+        const club = await run('INSERT INTO clubs (name) VALUES (?)', [clubName.trim()]);
+        if (manager) {
+            await run('UPDATE users SET name = ?, password_hash = ?, club_id = ? WHERE id = ?', [managerName.trim(), bcrypt.hashSync(managerPassword, 10), club.lastID, manager.id]);
+        } else {
+            await run('INSERT INTO users (name, role, email, password_hash, club_id) VALUES (?, ?, ?, ?, ?)', [managerName.trim(), 'club-manager', managerEmail.trim().toLowerCase(), bcrypt.hashSync(managerPassword, 10), club.lastID]);
+        }
+        res.status(201).json({ id: club.lastID, name: clubName.trim(), managerName: managerName.trim(), managerEmail: managerEmail.trim().toLowerCase() });
+    } catch (error) {
+        res.status(400).json({ error: error.message || 'Vereniging aanmaken mislukt.' });
+    }
+});
+
+app.get('/api/club/teams', allow('club-manager'), (req, res) => {
     sendQuery(`SELECT t.id, t.name, t.club, t.required_cars,
         (SELECT manager.name FROM users manager JOIN team_members tm ON tm.user_id = manager.id
             WHERE tm.team_id = t.id AND manager.role = 'team-manager' LIMIT 1) AS manager_name,
         (SELECT manager.email FROM users manager JOIN team_members tm ON tm.user_id = manager.id
             WHERE tm.team_id = t.id AND manager.role = 'team-manager' LIMIT 1) AS manager_email
-        FROM teams t ORDER BY t.club, t.name`, [], res);
+        FROM teams t WHERE t.club_id = ? ORDER BY t.name`, [req.user.clubId], res);
 });
 
-app.post('/api/admin/teams', allow('admin'), async (req, res) => {
-    const { teamName, clubName, managerName, managerEmail, managerPassword } = req.body;
-    if (![teamName, clubName, managerName, managerEmail, managerPassword].every(value => String(value || '').trim())) {
-        return res.status(400).json({ error: 'Vul team, vereniging en gegevens van de team-manager in.' });
+app.post('/api/club/teams', allow('club-manager'), async (req, res) => {
+    const { teamName, managerName, managerEmail, managerPassword } = req.body;
+    if (![teamName, managerName, managerEmail, managerPassword].every(value => String(value || '').trim())) {
+        return res.status(400).json({ error: 'Vul team en gegevens van de team-manager in.' });
     }
     if (!/^\S+@\S+\.\S+$/.test(managerEmail)) return res.status(400).json({ error: 'Vul een geldig e-mailadres in.' });
     if (String(managerPassword).length < 8) return res.status(400).json({ error: 'Het wachtwoord moet minimaal 8 tekens hebben.' });
     try {
-        const duplicateTeam = await get('SELECT id FROM teams WHERE name = ? AND club = ?', [teamName.trim(), clubName.trim()]);
+        const club = await get('SELECT id, name FROM clubs WHERE id = ?', [req.user.clubId]);
+        if (!club) return res.status(400).json({ error: 'Vereniging niet gevonden.' });
+        const duplicateTeam = await get('SELECT id FROM teams WHERE name = ? AND club_id = ?', [teamName.trim(), club.id]);
         if (duplicateTeam) return res.status(400).json({ error: 'Dit team bestaat al binnen de vereniging.' });
         let manager = await get('SELECT id, role FROM users WHERE email = ?', [managerEmail.trim().toLowerCase()]);
         if (manager && manager.role !== 'team-manager') return res.status(400).json({ error: 'Dit e-mailadres hoort al bij een andere rol.' });
@@ -180,9 +216,9 @@ app.post('/api/admin/teams', allow('admin'), async (req, res) => {
             const created = await run('INSERT INTO users (name, role, email, password_hash) VALUES (?, ?, ?, ?)', [managerName.trim(), 'team-manager', managerEmail.trim().toLowerCase(), bcrypt.hashSync(managerPassword, 10)]);
             manager = { id: created.lastID };
         }
-        const team = await run('INSERT INTO teams (name, club) VALUES (?, ?)', [teamName.trim(), clubName.trim()]);
+        const team = await run('INSERT INTO teams (name, club, club_id) VALUES (?, ?, ?)', [teamName.trim(), club.name, club.id]);
         await run('INSERT INTO team_members (team_id, user_id) VALUES (?, ?)', [team.lastID, manager.id]);
-        res.status(201).json({ id: team.lastID, name: teamName.trim(), club: clubName.trim(), managerName: managerName.trim(), managerEmail: managerEmail.trim().toLowerCase() });
+        res.status(201).json({ id: team.lastID, name: teamName.trim(), club: club.name, managerName: managerName.trim(), managerEmail: managerEmail.trim().toLowerCase() });
     } catch (error) {
         res.status(400).json({ error: error.message || 'Team aanmaken mislukt.' });
     }

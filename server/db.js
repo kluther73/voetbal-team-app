@@ -8,6 +8,10 @@ fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 const db = new sqlite3.Database(dbPath);
 
 db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS clubs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE
+    )`);
     db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -152,35 +156,44 @@ db.serialize(() => {
     db.run('ALTER TABLE users ADD COLUMN phone TEXT', () => {});
     db.run('ALTER TABLE users ADD COLUMN birth_date TEXT', () => {});
     db.run('ALTER TABLE users ADD COLUMN jersey_number INTEGER', () => {});
+    db.run('ALTER TABLE teams ADD COLUMN club_id INTEGER', () => {});
+    db.run('ALTER TABLE users ADD COLUMN club_id INTEGER', () => {});
     db.run("UPDATE events SET is_away = 1 WHERE title LIKE 'Uitwedstrijd%'");
     db.run("UPDATE events SET title = COALESCE(title, 'Wedstrijd'), type = COALESCE(type, 'match') WHERE title IS NULL OR type IS NULL");
     db.run("UPDATE users SET email = CASE name WHEN 'Sjaak Afhaak' THEN 'sjaak@team.nl' WHEN 'Piet Precies' THEN 'piet@team.nl' WHEN 'Klaas Vaak' THEN 'klaas@team.nl' ELSE email END WHERE email IS NULL");
     db.run('UPDATE users SET password_hash = ? WHERE password_hash IS NULL', [bcrypt.hashSync('voetbal123', 10)]);
     db.run(`UPDATE users SET first_name = COALESCE(first_name, CASE WHEN instr(name, ' ') > 0 THEN substr(name, 1, instr(name, ' ') - 1) ELSE name END)`);
     db.run(`UPDATE users SET last_name = COALESCE(last_name, CASE WHEN instr(name, ' ') > 0 THEN substr(name, instr(name, ' ') + 1) ELSE '' END)`);
-    
+    // Verenigingen bestonden alleen als vrije tekst op teams; normaliseer ze naar de clubs-tabel.
+    db.run('INSERT OR IGNORE INTO clubs (name) SELECT DISTINCT club FROM teams');
+    db.run('UPDATE teams SET club_id = (SELECT id FROM clubs WHERE clubs.name = teams.club) WHERE club_id IS NULL');
+
     db.get('SELECT COUNT(*) AS count FROM users', (existingErr, existingUsers) => {
         if (existingErr || existingUsers.count > 0) return;
-        db.run("INSERT INTO teams (name, club) SELECT 'JO13-1', 'RoodWit' WHERE NOT EXISTS (SELECT 1 FROM teams)", () => {
+        db.run("INSERT OR IGNORE INTO clubs (name) VALUES ('RoodWit')", () => {
+        db.get('SELECT id FROM clubs WHERE name = ?', ['RoodWit'], (clubErr, club) => {
+            if (clubErr || !club) return;
+        db.run("INSERT INTO teams (name, club, club_id) SELECT 'JO13-1', 'RoodWit', ? WHERE NOT EXISTS (SELECT 1 FROM teams)", [club.id], () => {
         db.get('SELECT id FROM teams LIMIT 1', (teamErr, team) => {
             if (teamErr || !team) return;
             db.run('INSERT OR IGNORE INTO positions (team_id, name) VALUES (?, ?), (?, ?), (?, ?), (?, ?)',
                 [team.id, 'Keeper', team.id, 'Verdediger', team.id, 'Middenvelder', team.id, 'Aanvaller']);
             const passwordHash = bcrypt.hashSync('voetbal123', 10);
             const seedUsers = [
-                ['Sjaak Afhaak', 'player', 'sjaak@team.nl', passwordHash, 0, 0],
-                ['Piet Precies', 'player', 'piet@team.nl', passwordHash, 0, 0],
-                ['Klaas Vaak', 'player', 'klaas@team.nl', passwordHash, 1, 0],
-                ['Noor Nuchter', 'player', 'noor@team.nl', passwordHash, 0, 0],
-                ['Sem Snel', 'player', 'sem@team.nl', passwordHash, 0, 0],
-                ['Anne Coach', 'team-manager', 'anne@team.nl', passwordHash, 0, 0],
-                ['Marco Trainer', 'trainer', 'marco@team.nl', passwordHash, 0, 0],
-                ['Beheerder RoodWit', 'admin', 'admin@team.nl', passwordHash, 0, 0],
-                ['Opa Jan', 'guardian', 'jan@team.nl', passwordHash, 0, 0],
-                ['Maaike Precies', 'guardian', 'maaike@team.nl', passwordHash, 0, 0],
-                ['Fatima Vaak', 'guardian', 'fatima@team.nl', passwordHash, 0, 0],
-                ['Tessa Nuchter', 'guardian', 'tessa@team.nl', passwordHash, 0, 0],
-                ['Rob Snel', 'guardian', 'rob@team.nl', passwordHash, 0, 0]
+                ['Sjaak Afhaak', 'player', 'sjaak@team.nl', passwordHash, 0, 0, null],
+                ['Piet Precies', 'player', 'piet@team.nl', passwordHash, 0, 0, null],
+                ['Klaas Vaak', 'player', 'klaas@team.nl', passwordHash, 1, 0, null],
+                ['Noor Nuchter', 'player', 'noor@team.nl', passwordHash, 0, 0, null],
+                ['Sem Snel', 'player', 'sem@team.nl', passwordHash, 0, 0, null],
+                ['Anne Coach', 'team-manager', 'anne@team.nl', passwordHash, 0, 0, null],
+                ['Marco Trainer', 'trainer', 'marco@team.nl', passwordHash, 0, 0, null],
+                ['Super Admin', 'admin', 'admin@team.nl', passwordHash, 0, 0, null],
+                ['Connie Clubbeheer', 'club-manager', 'connie@team.nl', passwordHash, 0, 0, club.id],
+                ['Opa Jan', 'guardian', 'jan@team.nl', passwordHash, 0, 0, null],
+                ['Maaike Precies', 'guardian', 'maaike@team.nl', passwordHash, 0, 0, null],
+                ['Fatima Vaak', 'guardian', 'fatima@team.nl', passwordHash, 0, 0, null],
+                ['Tessa Nuchter', 'guardian', 'tessa@team.nl', passwordHash, 0, 0, null],
+                ['Rob Snel', 'guardian', 'rob@team.nl', passwordHash, 0, 0, null]
             ];
             const events = [
                 ['match', 'Uitwedstrijd JO13-1', '2026-08-30', '10:00', 'Sportpark De Brug', 'SV Rivierwijk', 1],
@@ -190,10 +203,10 @@ db.serialize(() => {
 
             db.run('DELETE FROM attendance', () => db.run('DELETE FROM duties', () => db.run('DELETE FROM events', () =>
                 db.run('DELETE FROM guardian_players', () => db.run('DELETE FROM team_members', () => db.run('DELETE FROM users', () => {
-                    const usersStatement = db.prepare('INSERT INTO users (name, role, email, password_hash, exclude_driving, exclude_flagging) VALUES (?, ?, ?, ?, ?, ?)');
+                    const usersStatement = db.prepare('INSERT INTO users (name, role, email, password_hash, exclude_driving, exclude_flagging, club_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
                     seedUsers.forEach(user => usersStatement.run(user));
                     usersStatement.finalize(() => {
-                        db.run('INSERT INTO team_members (team_id, user_id) SELECT ?, id FROM users', [team.id], () => {
+                        db.run("INSERT INTO team_members (team_id, user_id) SELECT ?, id FROM users WHERE role NOT IN ('admin', 'club-manager')", [team.id], () => {
                             db.run(`INSERT INTO guardian_players (guardian_id, player_id)
                                 SELECT guardian.id, player.id
                                 FROM users guardian JOIN users player
@@ -218,6 +231,8 @@ db.serialize(() => {
                         });
                     });
                 }))))));
+        });
+        });
         });
         });
     });
