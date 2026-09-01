@@ -523,6 +523,37 @@ app.post('/api/events', allow('admin', 'team-manager'), (req, res) => {
     );
 });
 
+app.post('/api/training-schedule', allow('admin', 'team-manager'), async (req, res) => {
+    const { startDate, endDate, startTime, endTime, location, weekdays } = req.body;
+    const validDate = value => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(new Date(`${value}T12:00:00`).getTime());
+    const selectedWeekdays = [...new Set((weekdays || []).map(Number))].filter(day => Number.isInteger(day) && day >= 0 && day <= 6);
+    if (!validDate(startDate) || !validDate(endDate) || startDate > endDate) return res.status(400).json({ error: 'Vul een geldige begin- en einddatum in.' });
+    if (!/^\d{2}:\d{2}$/.test(startTime) || !/^\d{2}:\d{2}$/.test(endTime) || startTime >= endTime) return res.status(400).json({ error: 'Vul geldige begin- en eindtijden in.' });
+    if (!selectedWeekdays.length) return res.status(400).json({ error: 'Kies minimaal één trainingsdag.' });
+
+    try {
+        const dates = [];
+        const current = new Date(`${startDate}T12:00:00`);
+        const last = new Date(`${endDate}T12:00:00`);
+        while (current <= last) {
+            if (selectedWeekdays.includes(current.getDay())) dates.push(current.toISOString().slice(0, 10));
+            current.setDate(current.getDate() + 1);
+        }
+        let created = 0;
+        for (const date of dates) {
+            const trainingTime = `${startTime}-${endTime}`;
+            const existing = await get(`SELECT id FROM events WHERE team_id = ? AND type = 'training' AND date = ? AND time = ?`, [req.user.teamId, date, trainingTime]);
+            if (existing) continue;
+            const event = await run('INSERT INTO events (type, title, date, time, location, team_id) VALUES (?, ?, ?, ?, ?, ?)', ['training', 'Training', date, trainingTime, location?.trim() || null, req.user.teamId]);
+            await addAttendance(event.lastID, req.user.teamId);
+            created++;
+        }
+        res.status(201).json({ created, skipped: dates.length - created, total: dates.length });
+    } catch (error) {
+        res.status(400).json({ error: error.message });
+    }
+});
+
 app.get('/api/attendance/:eventId', (req, res) => {
     const { eventId } = req.params;
     const allowedRoles = ['admin', 'team-manager', 'trainer'];
