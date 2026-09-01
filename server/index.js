@@ -525,16 +525,27 @@ app.post('/api/events', allow('admin', 'team-manager'), (req, res) => {
 
 app.post('/api/training-schedule', allow('admin', 'team-manager'), async (req, res) => {
     const { startDate, endDate, startTime, endTime, location, weekdays } = req.body;
-    const validDate = value => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(new Date(`${value}T12:00:00`).getTime());
+    const normalizeDate = value => {
+        const match = /^(\d{4})-(\d{2})-(\d{2})$|^(\d{2})\/(\d{2})\/(\d{4})$/.exec(String(value || ''));
+        if (!match) return null;
+        const [, isoYear, isoMonth, isoDay, dutchDay, dutchMonth, dutchYear] = match;
+        const year = isoYear || dutchYear;
+        const month = isoMonth || dutchMonth;
+        const day = isoDay || dutchDay;
+        const parsed = new Date(`${year}-${month}-${day}T12:00:00`);
+        return parsed.getFullYear() === Number(year) && parsed.getMonth() === Number(month) - 1 && parsed.getDate() === Number(day) ? `${year}-${month}-${day}` : null;
+    };
+    const normalizedStartDate = normalizeDate(startDate);
+    const normalizedEndDate = normalizeDate(endDate);
     const selectedWeekdays = [...new Set((weekdays || []).map(Number))].filter(day => Number.isInteger(day) && day >= 0 && day <= 6);
-    if (!validDate(startDate) || !validDate(endDate) || startDate > endDate) return res.status(400).json({ error: 'Vul een geldige begin- en einddatum in.' });
+    if (!normalizedStartDate || !normalizedEndDate || normalizedStartDate > normalizedEndDate) return res.status(400).json({ error: 'Vul een geldige begin- en einddatum in.' });
     if (!/^\d{2}:\d{2}$/.test(startTime) || !/^\d{2}:\d{2}$/.test(endTime) || startTime >= endTime) return res.status(400).json({ error: 'Vul geldige begin- en eindtijden in.' });
     if (!selectedWeekdays.length) return res.status(400).json({ error: 'Kies minimaal één trainingsdag.' });
 
     try {
         const dates = [];
-        const current = new Date(`${startDate}T12:00:00`);
-        const last = new Date(`${endDate}T12:00:00`);
+        const current = new Date(`${normalizedStartDate}T12:00:00`);
+        const last = new Date(`${normalizedEndDate}T12:00:00`);
         while (current <= last) {
             if (selectedWeekdays.includes(current.getDay())) dates.push(current.toISOString().slice(0, 10));
             current.setDate(current.getDate() + 1);

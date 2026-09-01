@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="nl">
+<html lang="nl-NL">
 <head>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Voetbal Team App</title>
@@ -91,14 +91,10 @@
   <script>
     const toIsoDate=value=>{const match=/^(\d{2})\/(\d{2})\/(\d{4})$/.exec(value);if(!match)return null;const [,day,month,year]=match;const parsed=new Date(`${year}-${month}-${day}T12:00:00`);return parsed.getFullYear()===Number(year)&&parsed.getMonth()===Number(month)-1&&parsed.getDate()===Number(day)?`${year}-${month}-${day}`:null};
     const formatDutchTextDates=markup=>markup.replace(/\b(\d{1,2}) (januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december) (\d{4})\b/g,(_,day,month,year)=>`${String(day).padStart(2,'0')}/${String(['januari','februari','maart','april','mei','juni','juli','augustus','september','oktober','november','december'].indexOf(month)+1).padStart(2,'0')}/${year}`);
-    document.querySelectorAll('input[type="date"]').forEach(input=>{input.type='text';input.inputMode='numeric';input.placeholder='dd/mm/jjjj';input.pattern='\\d{2}/\\d{2}/\\d{4}';input.dataset.dateInput='true';input.addEventListener('input',()=>{const digits=input.value.replace(/\D/g,'').slice(0,8);input.value=digits.replace(/(\d{2})(\d)/,'$1/$2').replace(/(\d{2}\/\d{2})(\d)/,'$1/$2')})});
-    document.addEventListener('submit',event=>{const inputs=[...event.target.querySelectorAll('[data-date-input]')];const originalValues=inputs.map(input=>input.value);for(const input of inputs){if(!input.value)continue;const isoDate=toIsoDate(input.value);if(!isoDate){event.preventDefault();alert('Vul een geldige datum in als dd/mm/jjjj.');return;}input.value=isoDate;}queueMicrotask(()=>inputs.forEach((input,index)=>{input.value=originalValues[index]}))},true);
     const originalRenderSurveys=renderSurveys;
     renderSurveys=function(){originalRenderSurveys();['surveys-page','surveys'].forEach(id=>{const element=document.getElementById(id);if(element)element.innerHTML=formatDutchTextDates(element.innerHTML)})};
     const originalRenderTeamMembers=renderTeamMembers;
     renderTeamMembers=function(){originalRenderTeamMembers();const members=document.getElementById('team-members');if(members)members.innerHTML=members.innerHTML.replace(/\b(\d{4})-(\d{2})-(\d{2})\b/g,'$3/$2/$1')};
-    const originalEditMember=editMember;
-    editMember=function(memberId){originalEditMember(memberId);const birthDate=document.getElementById('member-birth-date');birthDate.value=formatDate(birthDate.value)};
   </script>
 </body>
 </html>
